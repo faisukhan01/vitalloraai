@@ -1,0 +1,19 @@
+{
+  "name": "@vitallora/ai-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bun sidecar exposing ZAI SDK (LLM/STT/TTS) over HTTP for the FastAPI backend. Backend-only; port 8100.",
+  "scripts": {
+    "start": "bun index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bash test-bridge.sh"
+  },
+  "dependencies": {
+    "z-ai-web-dev-sdk": "0.0.18"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.6",
+    "typescript": "^5.9.0"
+  }
+}

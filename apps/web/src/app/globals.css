@@ -1,0 +1,386 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * VITALORA AI — design tokens (spec §5)
+ *
+ * Design language: sophisticated glassmorphism + restrained neumorphism for an
+ * enterprise healthcare SaaS. Healthcare accent palette (teal/emerald) over
+ * warm stone neutrals. NO indigo/blue anywhere. Light + dark coherent.
+ *
+ * Layers:
+ *  1. @theme inline — maps CSS vars into Tailwind utilities (colors, shadows,
+ *     text scale, radii, fonts).
+ *  2. :root / .dark — actual token values (light / dark).
+ *  3. Component classes — .glass / .glass-strong / .glass-subtle surfaces.
+ *  4. Base — typography, focus-visible, scrollbar, reduced motion.
+ */
+
+@theme inline {
+  /* ── Shadcn-compatible semantic colors ─────────────────────────────── */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* ── Status colors (healthcare semantic set) ───────────────────────── */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-danger: var(--danger);
+
+  /* ── Glass surface tokens ──────────────────────────────────────────── */
+  --color-glass: var(--glass-bg);
+  --color-glass-strong: var(--glass-bg-strong);
+  --color-glass-subtle: var(--glass-bg-subtle);
+  --color-glass-border: var(--glass-border);
+
+  /* ── Brand accent scale (mirrors teal for token-level access) ──────── */
+  --color-brand: var(--primary);
+  --color-brand-foreground: var(--primary-foreground);
+  --color-brand-soft: var(--brand-soft);
+
+  /* ── Typography scale (4px-base rhythm; display sizes for marketing) ─ */
+  --text-display: var(--text-display-size);
+  --text-display--line-height: 1.06;
+  --text-display--letter-spacing: -0.024em;
+  --text-display-sm: var(--text-display-sm-size);
+  --text-display-sm--line-height: 1.12;
+  --text-display-sm--letter-spacing: -0.02em;
+  --text-eyebrow: 0.75rem;
+  --text-eyebrow--line-height: 1rem;
+  --text-eyebrow--letter-spacing: 0.14em;
+
+  /* ── Radii ─────────────────────────────────────────────────────────── */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* ── Elevation: soft realistic shadows + neumorphic subtle inset ───── */
+  --shadow-soft: var(--shadow-soft-value);
+  --shadow-lift: var(--shadow-lift-value);
+  --shadow-inset: var(--shadow-inset-value);
+  --shadow-glow: var(--shadow-glow-value);
+
+  /* ── Fonts ─────────────────────────────────────────────────────────── */
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+ * LIGHT THEME — warm stone surfaces, teal healthcare accent
+ * ──────────────────────────────────────────────────────────────────── */
+:root {
+  --radius: 0.625rem;
+
+  /* Display type scale (marketing + page headers) */
+  --text-display-size: 3.5rem;
+  --text-display-sm-size: 2.25rem;
+
+  --background: #fafaf9; /* stone-50 */
+  --foreground: #292524; /* stone-800 */
+  --card: #ffffff;
+  --card-foreground: #292524;
+  --popover: #ffffff;
+  --popover-foreground: #292524;
+
+  --primary: #0d9488; /* teal-600 */
+  --primary-foreground: #ffffff;
+  --brand-soft: #f0fdfa; /* teal-50 */
+
+  --secondary: #f5f5f4; /* stone-100 */
+  --secondary-foreground: #44403c; /* stone-700 */
+  --muted: #f5f5f4;
+  --muted-foreground: #78716c; /* stone-500 */
+  --accent: #f0fdfa;
+  --accent-foreground: #134e4a; /* teal-900 */
+
+  --destructive: #e11d48; /* rose-600 */
+  --success: #059669; /* emerald-600 */
+  --success-foreground: #ffffff;
+  --warning: #d97706; /* amber-600 */
+  --warning-foreground: #ffffff;
+  --danger: #e11d48;
+
+  --border: #e7e5e4; /* stone-200 */
+  --input: #e7e5e4;
+  --ring: #0d9488;
+
+  --chart-1: #0d9488; /* teal-600 */
+  --chart-2: #10b981; /* emerald-500 */
+  --chart-3: #f59e0b; /* amber-500 */
+  --chart-4: #f43f5e; /* rose-500 */
+  --chart-5: #78716c; /* stone-500 */
+
+  --sidebar: #f5f5f4;
+  --sidebar-foreground: #292524;
+  --sidebar-primary: #0d9488;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f0fdfa;
+  --sidebar-accent-foreground: #134e4a;
+  --sidebar-border: #e7e5e4;
+  --sidebar-ring: #0d9488;
+
+  /* Glass surfaces — light: white glass over warm background */
+  --glass-bg: rgb(255 255 255 / 0.62);
+  --glass-bg-strong: rgb(255 255 255 / 0.82);
+  --glass-bg-subtle: rgb(255 255 255 / 0.4);
+  --glass-border: rgb(12 10 9 / 0.07); /* black/7 on warm light */
+  --glass-blur: 16px;
+
+  /* Soft elevation + neumorphic subtle inset (light) */
+  --shadow-soft-value: 0 1px 2px rgb(12 10 9 / 0.05),
+    0 8px 24px -10px rgb(12 10 9 / 0.1);
+  --shadow-lift-value: 0 2px 4px rgb(12 10 9 / 0.05),
+    0 16px 40px -12px rgb(12 10 9 / 0.16);
+  --shadow-inset-value: inset 0 1px 0 rgb(255 255 255 / 0.75),
+    inset 0 -1px 0 rgb(12 10 9 / 0.03);
+  --shadow-glow-value: 0 8px 24px -8px rgb(13 148 136 / 0.45);
+
+  /* Ambient page gradient (very restrained) */
+  --ambient: radial-gradient(
+      1200px 600px at 85% -10%,
+      rgb(13 148 136 / 0.07),
+      transparent 60%
+    ),
+    radial-gradient(900px 500px at -10% 30%, rgb(16 185 129 / 0.05), transparent 55%);
+
+  /* Scrollbar */
+  --scrollbar-thumb: rgb(12 10 9 / 0.18);
+  --scrollbar-thumb-hover: rgb(12 10 9 / 0.3);
+  --scrollbar-track: transparent;
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+ * DARK THEME — deep warm charcoal, luminous teal
+ * ──────────────────────────────────────────────────────────────────── */
+.dark {
+  --background: #0c0a09; /* stone-950 */
+  --foreground: #e7e5e4; /* stone-200 */
+  --card: #1c1917; /* stone-900 */
+  --card-foreground: #e7e5e4;
+  --popover: #1c1917;
+  --popover-foreground: #e7e5e4;
+
+  --primary: #14b8a6; /* teal-500 — brighter for dark contrast */
+  --primary-foreground: #042f2e; /* teal-950 */
+  --brand-soft: #134e4a; /* teal-900 */
+
+  --secondary: #292524; /* stone-800 */
+  --secondary-foreground: #e7e5e4;
+  --muted: #292524;
+  --muted-foreground: #a8a29e; /* stone-400 */
+  --accent: #134e4a;
+  --accent-foreground: #ccfbf1; /* teal-100 */
+
+  --destructive: #f43f5e; /* rose-500 */
+  --success: #34d399; /* emerald-400 */
+  --success-foreground: #022c22;
+  --warning: #fbbf24; /* amber-400 */
+  --warning-foreground: #451a03;
+  --danger: #f43f5e;
+
+  --border: rgb(250 250 249 / 0.1); /* white/10 per spec */
+  --input: rgb(250 250 249 / 0.14);
+  --ring: #2dd4bf; /* teal-400 */
+
+  --chart-1: #2dd4bf;
+  --chart-2: #34d399;
+  --chart-3: #fbbf24;
+  --chart-4: #fb7185;
+  --chart-5: #a8a29e;
+
+  --sidebar: #1c1917;
+  --sidebar-foreground: #e7e5e4;
+  --sidebar-primary: #14b8a6;
+  --sidebar-primary-foreground: #042f2e;
+  --sidebar-accent: #134e4a;
+  --sidebar-accent-foreground: #ccfbf1;
+  --sidebar-border: rgb(250 250 249 / 0.1);
+  --sidebar-ring: #2dd4bf;
+
+  /* Glass surfaces — dark: charcoal glass */
+  --glass-bg: rgb(28 25 23 / 0.55);
+  --glass-bg-strong: rgb(28 25 23 / 0.78);
+  --glass-bg-subtle: rgb(28 25 23 / 0.38);
+  --glass-border: rgb(250 250 249 / 0.1); /* white/10 per spec */
+  --glass-blur: 18px;
+
+  /* Soft elevation + neumorphic subtle inset (dark) */
+  --shadow-soft-value: 0 1px 2px rgb(0 0 0 / 0.45),
+    0 8px 24px -10px rgb(0 0 0 / 0.5);
+  --shadow-lift-value: 0 2px 4px rgb(0 0 0 / 0.45),
+    0 16px 40px -12px rgb(0 0 0 / 0.6);
+  --shadow-inset-value: inset 0 1px 0 rgb(255 255 255 / 0.05),
+    inset 0 -1px 0 rgb(0 0 0 / 0.2);
+  --shadow-glow-value: 0 8px 24px -8px rgb(20 184 166 / 0.4);
+
+  --ambient: radial-gradient(
+      1200px 600px at 85% -10%,
+      rgb(20 184 166 / 0.09),
+      transparent 60%
+    ),
+    radial-gradient(900px 500px at -10% 30%, rgb(52 211 153 / 0.05), transparent 55%);
+
+  --scrollbar-thumb: rgb(250 250 249 / 0.16);
+  --scrollbar-thumb-hover: rgb(250 250 249 / 0.28);
+  --scrollbar-track: transparent;
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+ * GLASS SURFACES
+ * Thin borders, backdrop blur, soft realistic shadow + neumorphic sheen.
+ * ──────────────────────────────────────────────────────────────────── */
+@layer utilities {
+  .glass {
+    background: var(--glass-bg);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+    backdrop-filter: blur(var(--glass-blur)) saturate(1.35);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--shadow-soft-value), var(--shadow-inset-value);
+  }
+
+  .glass-strong {
+    background: var(--glass-bg-strong);
+    -webkit-backdrop-filter: blur(calc(var(--glass-blur) + 8px)) saturate(1.4);
+    backdrop-filter: blur(calc(var(--glass-blur) + 8px)) saturate(1.4);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--shadow-lift-value), var(--shadow-inset-value);
+  }
+
+  .glass-subtle {
+    background: var(--glass-bg-subtle);
+    -webkit-backdrop-filter: blur(calc(var(--glass-blur) - 6px)) saturate(1.2);
+    backdrop-filter: blur(calc(var(--glass-blur) - 6px)) saturate(1.2);
+    border: 1px solid var(--glass-border);
+    box-shadow: var(--shadow-inset-value);
+  }
+
+  /* Hairline top sheen for premium panels (use on relative containers) */
+  .glass-sheen {
+    position: relative;
+  }
+  .glass-sheen::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgb(255 255 255 / 0.35),
+      transparent
+    );
+    pointer-events: none;
+  }
+  .dark .glass-sheen::before {
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgb(255 255 255 / 0.14),
+      transparent
+    );
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+ * BASE
+ * ──────────────────────────────────────────────────────────────────── */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    background-image: var(--ambient);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 22%, transparent);
+  }
+
+  /* Accessible focus: visible ring for keyboard users */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  /* ── Thin, subtle scrollbars ─────────────────────────────────────── */
+  html {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover);
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+ * REDUCED MOTION — respect prefers-reduced-motion globally
+ * ──────────────────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

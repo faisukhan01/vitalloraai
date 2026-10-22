@@ -1,0 +1,53 @@
+# VITALORA AI — full local stack
+# Usage:
+#   cp .env.example .env.local   # fill in real values (never committed)
+#   docker compose up --build
+#
+# The web app talks to the backend via the public API base URL; the backend
+# talks to the bridge over the internal Docker network.
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Browser-side API base. For a machine-local compose stack:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_PORT: ""
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: services/ai-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.local
+    environment:
+      # Inside the compose network the bridge is reachable by service name:
+      AI_BRIDGE_URL: http://ai-bridge:8100
+      CORS_ORIGINS: http://localhost:3000
+      COOKIE_SECURE: "false"
+    depends_on:
+      - ai-bridge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/ready')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  ai-bridge:
+    build: services/ai-bridge
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"fetch('http://localhost:8100/health').then(r=>{if(!r.ok)process.exit(1)})\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped

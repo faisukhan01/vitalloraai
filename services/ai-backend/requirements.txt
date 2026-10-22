@@ -1,0 +1,17 @@
+# VITALORA AI - Python backend dependencies
+# Python 3.12+. Install: python -m pip install -r requirements.txt
+
+fastapi>=0.128.0
+uvicorn[standard]>=0.44.0
+pydantic>=2.12.0
+pydantic-settings>=2.13.0
+PyJWT>=2.12.0
+argon2-cffi>=25.1.0
+httpx>=0.28.0
+libsql-experimental>=0.0.40
+python-multipart>=0.0.24
+
+# Testing & tooling
+pytest>=9.0.0
+pytest-asyncio>=1.3.0
+ruff>=0.9.0

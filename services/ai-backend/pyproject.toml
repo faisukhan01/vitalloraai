@@ -1,0 +1,25 @@
+# VITALORA AI — Python backend project config.
+# Dependency pins live in requirements.txt (pip). This file only configures
+# tooling (ruff, pytest) for the services/ai-backend package.
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ISC", "BLE", "FURB"]
+ignore = [
+    # FastAPI dependency injection REQUIRES call expressions in parameter
+    # defaults (Depends(...), Query(...)); B008 is a false positive here.
+    "B008",
+    # Implicit string concatenation in collection literals appears in the
+    # lead-owned demo seed data (app/db/seed.py); cosmetic, left untouched.
+    "ISC004",
+    # Long lines exist throughout the lead-owned foundation (auth.py, seed.py,
+    # client.py); reformatting them is out of this task's scope.
+    "E501",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
