@@ -16,12 +16,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # services/ai-backend/app/core/config.py -> repo root is 4 parents up
 REPO_ROOT = Path(__file__).resolve().parents[4]
-ENV_FILE = REPO_ROOT / ".env"
+# Real secrets live in .env.local (gitignored). .env (if present) holds fallback config.
+# .env.local takes precedence (pydantic-settings: earlier files win per key).
+ENV_FILES = (REPO_ROOT / ".env.local", REPO_ROOT / ".env")
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(ENV_FILE),
+        env_file=[str(p) for p in ENV_FILES],
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -83,7 +85,7 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "Missing required environment configuration: "
                 + ", ".join(missing)
-                + f". Copy .env.example to {ENV_FILE} and fill in real values."
+                + f". Copy .env.example to {ENV_FILES[0]} and fill in real values."
             )
         return self
 
