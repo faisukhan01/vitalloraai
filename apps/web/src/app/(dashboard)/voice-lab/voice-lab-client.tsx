@@ -41,10 +41,10 @@ interface Turn extends Pick<ConversationMessage, "role" | "content" | "tool_name
   id: string;
 }
 
-const SILENCE_MS = 1300;
+const SILENCE_MS = 750; // phone-like turn taking: send ~0.75s after the caller stops
 const MAX_UTTERANCE_MS = 15000;
 const MIN_UTTERANCE_MS = 450; // discard noise blips
-const CALIBRATION_FRAMES = 48; // ~0.8 s of ambient-noise sampling at 60 fps
+const CALIBRATION_FRAMES = 30; // ~0.5 s of ambient-noise sampling at 60 fps
 const LOW_MIC_HINT_MS = 6000;
 
 interface WavPacket {
@@ -173,6 +173,10 @@ export function VoiceLabClient() {
   const calibDoneRef = useRef(false);
   // Assistant-playback gating (echo-proof turn taking)
   const speakingRef = useRef(false);
+  // Sentence-streamed replies arrive as several audio messages; they must
+  // play back-to-back as a queue, not overwrite each other.
+  const audioQueueRef = useRef<string[]>([]);
+  const audioPlayingRef = useRef(false);
   // Low-mic hint state
   const quietMsRef = useRef(0);
   const lastTickRef = useRef(0);
@@ -211,6 +215,9 @@ export function VoiceLabClient() {
       el.pause();
       el.currentTime = 0;
     }
+    audioQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
+    audioQueueRef.current = [];
+    audioPlayingRef.current = false;
   }, []);
 
   // ── Microphone capture + VAD ────────────────────────────────────────────
@@ -439,7 +446,36 @@ export function VoiceLabClient() {
       const finishPlayback = () => {
         if (!speakingRef.current) return;
         speakingRef.current = false;
+        resetVadCalibration();
         setStage((s) => (s === "ended" || s === "error" ? s : "listening"));
+      };
+
+      // Queue player: streamed reply chunks play back-to-back; the mic stays
+      // disarmed until the whole reply has finished (or the caller barges in).
+      const playNextChunk = () => {
+        const next = audioQueueRef.current.shift();
+        if (!next) {
+          audioPlayingRef.current = false;
+          finishPlayback();
+          return;
+        }
+        const el = audioElRef.current ?? new Audio();
+        audioElRef.current = el;
+        el.src = next;
+        audioPlayingRef.current = true;
+        el.onended = () => {
+          URL.revokeObjectURL(next);
+          playNextChunk();
+        };
+        void el.play().catch(() => {
+          URL.revokeObjectURL(next);
+          // Autoplay blocked: drop the queue, recover to listening with text visible.
+          stopAudio();
+          speakingRef.current = false;
+          resetVadCalibration();
+          setStage("listening");
+          setErrorMsg("Autoplay was blocked by the browser. Click anywhere on the page, then start the call again.");
+        });
       };
 
       ws.onmessage = (event) => {
@@ -455,9 +491,9 @@ export function VoiceLabClient() {
         };
         switch (msg.type) {
           case "status":
-            // Ignore the server's "listening" while assistant audio is still
-            // playing locally — the mic must not arm during playback.
-            if (msg.stage === "listening" && speakingRef.current) break;
+            // Ignore the server's "listening" while reply audio is still
+            // queued/playing locally — the mic must not arm during playback.
+            if (msg.stage === "listening" && (speakingRef.current || audioPlayingRef.current)) break;
             if (msg.stage === "listening") resetVadCalibration();
             if (msg.stage) setStage(msg.stage as Stage);
             break;
@@ -474,20 +510,10 @@ export function VoiceLabClient() {
               for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
               const blob = new Blob([bytes.buffer], { type: msg.format === "mp3" ? "audio/mpeg" : "audio/wav" });
               const url = URL.createObjectURL(blob);
-              const el = audioElRef.current ?? new Audio();
-              audioElRef.current = el;
-              el.src = url;
               speakingRef.current = true;
               setStage("speaking");
-              el.onended = () => {
-                URL.revokeObjectURL(url);
-                finishPlayback();
-              };
-              void el.play().catch(() => {
-                speakingRef.current = false;
-                setStage("listening");
-                setErrorMsg("Autoplay was blocked by the browser. Click anywhere on the page, then start the call again.");
-              });
+              audioQueueRef.current.push(url);
+              if (!audioPlayingRef.current) playNextChunk();
             }
             break;
           }
@@ -525,7 +551,7 @@ export function VoiceLabClient() {
         setErrorMsg("Could not start the call. Verify the backend and ai-bridge services are running, then try again.");
       }
     }
-  }, [addTurn, language, receptionistId, resetVadCalibration, setupMic]);
+  }, [addTurn, language, receptionistId, resetVadCalibration, setupMic, stopAudio]);
 
   useEffect(() => {
     return () => {

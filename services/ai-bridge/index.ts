@@ -438,6 +438,33 @@ async function handleStt(req: Request, startedAt: number): Promise<Response> {
 // header. Strategy: synthesize every chunk as WAV, extract raw PCM, and
 // re-encode ONE canonical 44-byte WAV header with the shared fmt parameters.
 
+// LRU cache for finished audio. Voice calls repeat fixed phrases constantly
+// (greetings, "I did not catch that", confirmations) and the provider can take
+// 2-16s per synthesis — replaying cached audio turns those into ~0ms.
+const TTS_CACHE_MAX_ENTRIES = 80;
+const ttsCache = new Map<string, { audio: Buffer; createdAt: number }>();
+
+function ttsCacheKey(text: string, voice: string, speed: number): string {
+  return `${voice}|${speed}|${text}`;
+}
+
+function ttsCacheGet(key: string): Buffer | null {
+  const hit = ttsCache.get(key);
+  if (!hit) return null;
+  // Refresh insertion order for LRU behavior.
+  ttsCache.delete(key);
+  ttsCache.set(key, hit);
+  return hit.audio;
+}
+
+function ttsCachePut(key: string, audio: Buffer): void {
+  if (ttsCache.size >= TTS_CACHE_MAX_ENTRIES) {
+    const oldest = ttsCache.keys().next().value;
+    if (oldest !== undefined) ttsCache.delete(oldest);
+  }
+  ttsCache.set(key, { audio, createdAt: Date.now() });
+}
+
 function readAscii(buf: Buffer, start: number, len: number): string {
   return buf.subarray(start, start + len).toString("latin1");
 }
@@ -617,6 +644,18 @@ async function handleTts(req: Request, startedAt: number): Promise<Response> {
   }
 
   const zai = await getZai();
+  const cacheKey = ttsCacheKey(text, voice, speed);
+  const cached = ttsCacheGet(cacheKey);
+  if (cached) {
+    logRequest("info", "/tts", startedAt, 200, {
+      chars: text.length,
+      audio_bytes: cached.length,
+      chunks: 0,
+      cache: "hit",
+    });
+    return json(200, { audio_base64: cached.toString("base64"), format: "wav", duration_hint_ms: null });
+  }
+
   const chunks = splitTtsText(text);
   if (chunks.length === 0) {
     throw new ApiError(400, "invalid_request", "`text` contains no synthesizable content");
@@ -663,7 +702,9 @@ async function handleTts(req: Request, startedAt: number): Promise<Response> {
     chars: text.length,
     audio_bytes: audio.length,
     chunks: chunks.length,
+    cache: "miss",
   });
+  ttsCachePut(cacheKey, audio);
   // duration_hint_ms stays null — we do not guess; caller can decode the WAV.
   return json(200, {
     audio_base64: audio.toString("base64"),

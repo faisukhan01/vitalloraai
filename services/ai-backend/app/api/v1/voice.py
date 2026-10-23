@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import re
 from contextlib import suppress
 from datetime import UTC, datetime
 
@@ -108,7 +109,20 @@ async def start_voice_session(
         started_at=now,
         caller_ref=caller_ref,
     )
-    return VoiceSessionStartResponse(session=session, greeting_text=receptionist["greeting_message"])
+    # Warm the TTS cache for this receptionist's greeting while the caller is
+    # still looking at the "connecting" screen — the WS "greet" frame that
+    # arrives seconds later then hits the cache and speaks instantly.
+    greeting_text = (receptionist.get("greeting_message") or "").strip()
+    if greeting_text:
+        voice = receptionist["voice_id"]
+        speed = float(receptionist["speaking_speed"] or 1.0)
+
+        async def _warm() -> None:
+            with suppress(ProviderError, Exception):
+                await get_tts().synthesize(greeting_text, voice=voice, speed=speed)
+
+        _bg(_warm())
+    return VoiceSessionStartResponse(session=session, greeting_text=greeting_text)
 
 
 @router.post("/sessions/{session_id}/end", response_model=VoiceSessionEndResponse)
@@ -239,6 +253,25 @@ async def _persist_message(
     )
 
 
+def _bg(coro) -> None:
+    """Run a non-critical coroutine without blocking the voice path.
+
+    DB writes (transcripts, usage) must not add 2-4 Turso round-trips of latency
+    to the hot turn loop. They still run to completion in the same process; the
+    next turn arrives seconds later, by which time they have landed.
+    """
+
+    def _log_failure(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            ws_logger.warning("background write failed: %s", exc)
+
+    task = asyncio.create_task(coro)
+    task.add_done_callback(_log_failure)
+
+
 async def _record_usage(org_id: str, session_id: str, kind: str, provider: str, quantity: float) -> None:
     await db.write(
         "INSERT INTO usage_records (id, organization_id, session_id, kind, provider, quantity, created_at) "
@@ -254,8 +287,82 @@ async def _speak_and_send(ws: WebSocket, text: str, voice: str, speed: float) ->
     t0 = _time.perf_counter()
     audio_b64, fmt = await get_tts().synthesize(text, voice=voice, speed=speed)
     await ws.send_json({"type": "audio", "format": fmt, "data": audio_b64})
-    await _record_usage(ws.state.org_id, ws.state.session_id, "tts_chars", ws.state.tts_provider, len(text))
+    _bg(_record_usage(ws.state.org_id, ws.state.session_id, "tts_chars", ws.state.tts_provider, len(text)))
     log_extra(ws_logger, logging.INFO, "tts delivered", chars=len(text), ms=int((_time.perf_counter() - t0) * 1000))
+
+
+_SENTENCE_END_RE = re.compile(r"[.!?。！？](?=\s|$)")
+_FIRST_GROUP_MAX = 220   # first spoken group: one short sentence for fastest first audio
+_GROUP_MAX = 700         # later groups: several sentences per synthesis request
+
+
+def _split_speech_groups(text: str) -> list[str]:
+    """Split a reply into speakable groups.
+
+    The first group is a single short sentence so the caller hears the
+    receptionist begin answering as early as possible; the remainder is
+    batched into larger groups (fewer synthesis requests overall).
+    """
+    text = text.strip()
+    if not text:
+        return []
+    matches = list(_SENTENCE_END_RE.finditer(text))
+    bounds = [0] + [m.end() for m in matches] + [len(text)]
+    sentences: list[str] = []
+    for i in range(len(bounds) - 1):
+        part = text[bounds[i]:bounds[i + 1]].strip()
+        if part:
+            sentences.append(part)
+    if not sentences:
+        return [text]
+
+    first = sentences[0]
+    if len(first) > _FIRST_GROUP_MAX:
+        # Very long opening sentence: fall back to the whole-text path.
+        return [text]
+    groups = [first]
+
+    rest: list[str] = []
+    for s in sentences[1:]:
+        if rest and sum(len(x) for x in rest) + len(s) + 1 > _GROUP_MAX:
+            groups.append(" ".join(rest))
+            rest = [s]
+        else:
+            rest.append(s)
+    if rest:
+        groups.append(" ".join(rest))
+    return groups
+
+
+async def _speak_stream_and_send(ws: WebSocket, text: str, voice: str, speed: float) -> None:
+    """Speak a reply sentence-group by sentence-group.
+
+    Every group is sent to the browser the moment its audio exists, so the
+    caller hears the first sentence while later groups are still synthesizing.
+    Turns a 3-16s silent wait into ~1-2s of time-to-first-audio.
+    """
+    import time as _time
+
+    groups = _split_speech_groups(text)
+    if len(groups) <= 1:
+        await _speak_and_send(ws, text, voice, speed)
+        return
+
+    await ws.send_json({"type": "status", "stage": "speaking"})
+    t0 = _time.perf_counter()
+    total_chars = 0
+    for group in groups:
+        try:
+            audio_b64, fmt = await get_tts().synthesize(group, voice=voice, speed=speed)
+        except ProviderError:
+            if total_chars == 0:
+                raise
+            log_extra(ws_logger, logging.WARNING, "tts stream group failed mid-reply", chars=len(group))
+            break
+        total_chars += len(group)
+        await ws.send_json({"type": "audio", "format": fmt, "data": audio_b64})
+    _bg(_record_usage(ws.state.org_id, ws.state.session_id, "tts_chars", ws.state.tts_provider, total_chars))
+    log_extra(ws_logger, logging.INFO, "tts stream delivered", chars=total_chars, groups=len(groups), ms=int((_time.perf_counter() - t0) * 1000))
 
 
 @router.websocket("/ws/{session_id}")
@@ -290,6 +397,9 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
     websocket.state.tts_provider = get_tts().name
 
     log_extra(ws_logger, logging.INFO, "voice ws connected", session_id=session_id, language=language, voice=voice_id)
+    # Prewarm any pool connections that went idle since the last activity so
+    # this conversation's first turn never pays a cold-session stall.
+    _bg(db.prewarm_idle())
 
     try:
         while True:
@@ -313,9 +423,9 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                 greeting = (receptionist.get("greeting_message") or "").strip()
                 if greeting:
                     await websocket.send_json({"type": "transcript", "role": "assistant", "text": greeting})
-                    await _persist_message(session_id, principal.organization_id, "assistant", greeting)
+                    _bg(_persist_message(session_id, principal.organization_id, "assistant", greeting))
                     try:
-                        await _speak_and_send(websocket, greeting, voice_id, speed)
+                        await _speak_stream_and_send(websocket, greeting, voice_id, speed)
                     except ProviderError:
                         await websocket.send_json({"type": "error", "message": "Voice synthesis failed; showing text only."})
                 await websocket.send_json({"type": "status", "stage": "listening"})
@@ -355,23 +465,30 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                         await asyncio.sleep(0.15)
                         user_text = await get_stt().transcribe(audio_b64, language)  # type: ignore[arg-type]
                 log_extra(ws_logger, logging.INFO, "stt done", chars=len(user_text), ms=int((_time.perf_counter() - t0) * 1000))
-                await _record_usage(principal.organization_id, session_id, "stt_seconds", get_stt().name, 3.0)
+                websocket.state._t_stt_done = _time.perf_counter()
+                _bg(_record_usage(principal.organization_id, session_id, "stt_seconds", get_stt().name, 3.0))
 
             if not user_text:
                 await _persist_message(session_id, principal.organization_id, "assistant", _RETRY_SAY)
                 with suppress(ProviderError):
-                    await _speak_and_send(websocket, _RETRY_SAY, voice_id, speed)
+                    await _speak_stream_and_send(websocket, _RETRY_SAY, voice_id, speed)
                 await websocket.send_json({"type": "status", "stage": "listening"})
                 continue
 
             await websocket.send_json({"type": "transcript", "role": "user", "text": user_text})
-            await _persist_message(session_id, principal.organization_id, "user", user_text)
+            # Background: persistence must not block the turn (and the history
+            # query inside run_turn deliberately covers only PREVIOUS turns —
+            # the current utterance is appended to the prompt explicitly).
+            _bg(_persist_message(session_id, principal.organization_id, "user", user_text))
 
             # ── 2) Orchestration (safety + RAG + tools) ──────────────────
             await websocket.send_json({"type": "status", "stage": "thinking"})
             import time as _time
 
             t0 = _time.perf_counter()
+            t_stt_done = getattr(websocket.state, "_t_stt_done", None)
+            if t_stt_done is not None:
+                log_extra(ws_logger, logging.INFO, "pre-llm overhead", ms=int((t0 - t_stt_done) * 1000))
             try:
                 result = await run_turn(
                     ctx=ctx,
@@ -390,31 +507,36 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                 await websocket.send_json({"type": "error", "message": "An unexpected error occurred."})
                 continue
             turn_ms = int((_time.perf_counter() - t0) * 1000)
+            log_extra(ws_logger, logging.INFO, "orchestrated", turn_ms=turn_ms, say_chars=len(result.say), tools=len(result.tool_calls))
 
             for tc in result.tool_calls:
                 await websocket.send_json({"type": "tool", "tool": tc.get("tool"), "arguments": tc.get("arguments")})
-                await _persist_message(
+                _bg(_persist_message(
                     session_id, principal.organization_id, "tool", None,
                     tool_name=tc.get("tool"), tool_payload=tc.get("arguments"),
-                )
+                ))
             if result.outcome_hint:
-                await db.write(
+                _bg(db.write(
                     "UPDATE conversation_sessions SET outcome = ? WHERE id = ? AND outcome IS NULL",
                     (result.outcome_hint, session_id),
-                )
+                ))
 
             await websocket.send_json({"type": "transcript", "role": "assistant", "text": result.say})
-            await _persist_message(
+            _bg(_persist_message(
                 session_id, principal.organization_id, "assistant", result.say, latency_ms=turn_ms
-            )
-            await _record_usage(principal.organization_id, session_id, "llm_requests", get_llm().name, 1)
+            ))
+            _bg(_record_usage(principal.organization_id, session_id, "llm_requests", get_llm().name, 1))
 
-            # ── 3) Speech synthesis ──────────────────────────────────────
+            # ── 3) Speech synthesis (sentence-streamed for fast first audio)
+            log_extra(ws_logger, logging.INFO, "speak start", post_orchestration_ms=int((_time.perf_counter() - t0) * 1000 - turn_ms))
             try:
-                await _speak_and_send(websocket, result.say, voice_id, speed)
+                await _speak_stream_and_send(websocket, result.say, voice_id, speed)
             except ProviderError:
                 await websocket.send_json({"type": "error", "message": "Voice synthesis failed; showing text only."})
             await websocket.send_json({"type": "status", "stage": "listening"})
+            # Keep the pool warm during natural conversation pauses so the next
+            # turn starts with live connections instead of stale ones.
+            _bg(db.prewarm_idle())
 
         # Client said end / clean close: finalize session if still active.
         await db.write(

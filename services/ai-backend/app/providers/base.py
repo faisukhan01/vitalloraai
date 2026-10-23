@@ -52,15 +52,31 @@ class ZAIBridgeProvider:
     name = "zai"
 
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(base_url=settings.ai_bridge_url, timeout=TTS_TIMEOUT)
+        # Defensive pool config: keepalive connections expire after 1s idle so a
+        # half-dead Bun-side socket is never reused (reuse-on-stale manifests as
+        # multi-second silent hangs before the request even reaches the bridge),
+        # and pool waits raise after 5s instead of blocking indefinitely.
+        self._client = httpx.AsyncClient(
+            base_url=settings.ai_bridge_url,
+            timeout=TTS_TIMEOUT,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=5, keepalive_expiry=1.0),
+        )
 
     async def _post(self, path: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        import time as _time
+
+        t0 = _time.perf_counter()
+        timed = httpx.Timeout(timeout, connect=5.0, pool=5.0)
         try:
-            resp = await self._client.post(path, json=payload, timeout=timeout)
+            resp = await self._client.post(path, json=payload, timeout=timed)
         except httpx.TimeoutException as exc:
             raise ProviderError("The AI service took too long to respond.") from exc
         except httpx.HTTPError as exc:
             raise ProviderError("The AI service is unreachable. Is the ai-bridge sidecar running?") from exc
+        logger.info(
+            "bridge call done",
+            extra={"route": path, "ms": int((_time.perf_counter() - t0) * 1000)},
+        )
         if resp.status_code != 200:
             try:
                 detail = resp.json().get("error", {}).get("message", "")

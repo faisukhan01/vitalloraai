@@ -221,21 +221,42 @@ async def run_turn(
             outcome_hint="transferred_to_human",
         )
 
-    # 2) Grounded knowledge for this turn.
+    # 2) Grounded knowledge + conversation history — independent reads, run in
+    #    parallel to shave a Turso round-trip off every turn.
+    history_rows: list = []
     knowledge_blocks: list[dict] = []
     if capabilities.get("knowledge_qa", True):
         try:
-            knowledge_blocks = await search_knowledge(ctx.org_id, user_text, limit=3)
+            knowledge_task = search_knowledge(ctx.org_id, user_text, limit=3)
         except Exception:  # noqa: BLE001
-            logger.warning("knowledge retrieval failed; continuing ungrounded")
+            knowledge_task = None
+    else:
+        knowledge_task = None
 
-    # 3) Conversation history from DB (persisted, so sessions survive reconnects).
-    history_rows = await db.execute(
+    import asyncio as _asyncio
+
+    history_task = db.execute(
         "SELECT role, content FROM conversation_messages WHERE session_id = ? AND role IN ('user','assistant') "
         "ORDER BY created_at DESC LIMIT ?",
         (ctx.session_id, MAX_HISTORY_MESSAGES),
     )
+    gathered = await _asyncio.gather(
+        knowledge_task if knowledge_task is not None else _asyncio.sleep(0, result=[]),
+        history_task,
+        return_exceptions=True,
+    )
+    kb_result, hist_result = gathered[0], gathered[1]
+    if isinstance(kb_result, list):
+        knowledge_blocks = kb_result
+    else:
+        logger.warning("knowledge retrieval failed; continuing ungrounded")
+    history_rows = hist_result if isinstance(hist_result, list) else []
     history = [{"role": r["role"], "content": r["content"] or ""} for r in reversed(history_rows)]
+
+    import time as _time
+
+    _t_ctx = _time.perf_counter()
+    logger.info("context loaded", extra={"timing_ms": int((_t_ctx - _t_turn_start) * 1000)} if (_t_turn_start := getattr(ctx, "_t_start", None)) else {})
 
     system_prompt = build_system_prompt(
         receptionist=receptionist,
