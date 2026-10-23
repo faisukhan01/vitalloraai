@@ -126,7 +126,7 @@ async def start_voice_session(
         # burns rate budget exactly when the caller's first turn needs it.
         # The remaining ack lines warm opportunistically via the instant-ack
         # probe (cache misses simply skip the ack).
-        for line in (_ACK_LINES[0], _RETRY_SAY):
+        for line in (_ACK_LINES[0], _RETRY_SAY, _BUSY_SAY):
             with suppress(ProviderError, Exception):
                 await get_tts().synthesize(line, voice=voice, speed=speed)
             await asyncio.sleep(1.2)
@@ -201,6 +201,7 @@ async def end_voice_session(
 ws_logger = logging.getLogger("vitalora.voice")
 
 _RETRY_SAY = "I am sorry, I did not catch that. Could you say it again?"
+_BUSY_SAY = "Sorry, our system is a little busy right now. Could you please say that again in a moment?"
 
 # ── Instant acknowledgment backchannel ───────────────────────────────────────
 # A real receptionist acknowledges instantly ("Mm-hmm", "One moment") before
@@ -346,6 +347,7 @@ async def _speak_instant_ack(ws: WebSocket, voice: str, speed: float) -> None:
 
 
 _SENTENCE_END_RE = re.compile(r"[.!?。！？](?=\s|$)")
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:，；：])\s+")
 _FIRST_GROUP_MAX = 220   # first spoken group: one short sentence for fastest first audio
 _GROUP_MAX = 700         # later groups: several sentences per synthesis request
 
@@ -356,6 +358,11 @@ def _split_speech_groups(text: str) -> list[str]:
     The first group is a single short sentence so the caller hears the
     receptionist begin answering as early as possible; the remainder is
     batched into larger groups (fewer synthesis requests overall).
+
+    Long single sentences (e.g. "Open Monday 9-5, Saturday 10-2, closed
+    Sunday.") have no sentence-end punctuation, so they are split on clause
+    boundaries instead — a spoken clause break sounds natural and the first
+    clause starts playing ~1.5-2 s sooner than whole-sentence synthesis.
     """
     text = text.strip()
     if not text:
@@ -369,6 +376,22 @@ def _split_speech_groups(text: str) -> list[str]:
             sentences.append(part)
     if not sentences:
         return [text]
+
+    # Long sentenceless reply: cut a short leading clause group for fast TTS.
+    if len(sentences) == 1 and len(sentences[0]) > 120:
+        clauses = [c for c in _CLAUSE_SPLIT_RE.split(sentences[0]) if c]
+        if len(clauses) > 1:
+            first: list[str] = []
+            length = 0
+            cut = 0
+            for i, clause in enumerate(clauses):
+                first.append(clause)
+                length += len(clause) + 1
+                cut = i + 1
+                if length >= 50:
+                    break
+            if cut < len(clauses) and length <= 130:
+                return [" ".join(first), " ".join(clauses[cut:])]
 
     first = sentences[0]
     if len(first) > _FIRST_GROUP_MAX:
@@ -582,8 +605,15 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                     user_text=user_text,
                 )
             except ProviderError:
-                await websocket.send_json({"type": "error", "message": "The AI service is unavailable right now."})
+                # Never leave the caller in dead silence: apologize in voice,
+                # keep the session alive and return to listening so a simple
+                # retry just works once the provider throttle window passes.
                 await _persist_message(session_id, principal.organization_id, "system", "llm_error")
+                await websocket.send_json({"type": "transcript", "role": "assistant", "text": _BUSY_SAY})
+                _bg(_persist_message(session_id, principal.organization_id, "assistant", _BUSY_SAY))
+                with suppress(ProviderError):
+                    await _speak_stream_and_send(websocket, _BUSY_SAY, voice_id, speed)
+                await websocket.send_json({"type": "status", "stage": "listening"})
                 continue
             except Exception:  # noqa: BLE001
                 ws_logger.exception("orchestrator failure")

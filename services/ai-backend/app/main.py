@@ -37,7 +37,23 @@ async def lifespan(app: FastAPI):
 
     await _db.prewarm_pool()
     log_extra(logger, logging.INFO, "db pool warmed", pool_size=5)
+
+    # Own the AI sidecar lifecycle: without the bridge there is no STT, LLM
+    # or TTS, so it must be up (and stay up) before the first call arrives.
+    from app.core import bridge_supervisor
+
+    try:
+        if await bridge_supervisor.ensure_bridge():
+            log_extra(logger, logging.INFO, "ai-bridge ready", url=settings.ai_bridge_url)
+        else:
+            log_extra(logger, logging.ERROR, "ai-bridge UNAVAILABLE — voice calls will fail until it is up")
+    except Exception:  # noqa: BLE001 — never block boot on the sidecar
+        logger.exception("ai-bridge startup probe failed")
+    bridge_supervisor.start_watchdog()
+
     yield
+    # The bridge is intentionally left running on shutdown (detached session)
+    # so in-flight calls survive a backend reload; the next boot adopts it.
     log_extra(logger, logging.INFO, "backend shutting down")
 
 
