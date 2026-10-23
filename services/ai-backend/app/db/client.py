@@ -35,11 +35,45 @@ class PooledConnection:
         )
         self.lock = asyncio.Lock()
 
+    def _fresh_connection(self) -> None:
+        """Replace the underlying libsql connection (used on stale streams)."""
+        try:
+            self.conn.close()
+        except Exception:  # pragma: no cover - close is best-effort
+            pass
+        self.conn = libsql.connect(
+            settings.turso_database_url,
+            auth_token=settings.turso_auth_token,
+        )
+
+    @staticmethod
+    def _is_stale_stream(exc: Exception) -> bool:
+        """Turso expires long-idle Hrana streams; detect and reconnect."""
+        text = str(exc)
+        return "stream not found" in text or "session not found" in text
+
     def _exec(self, sql: str, params: tuple) -> tuple[list[str], list[tuple]]:
-        cur = self.conn.execute(sql, params)
+        try:
+            cur = self.conn.execute(sql, params)
+        except (ValueError, Exception) as exc:
+            if not self._is_stale_stream(exc):
+                raise
+            # Turso reaped the idle stream — reconnect once and retry.
+            logger.info("stale Turso stream detected; reconnecting pooled connection")
+            self._fresh_connection()
+            cur = self.conn.execute(sql, params)
         cols = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall() if cur.description else []
         return cols, [tuple(r) for r in (rows or [])]
+
+    def _commit(self) -> None:
+        try:
+            self.conn.commit()
+        except (ValueError, Exception) as exc:
+            if not self._is_stale_stream(exc):
+                raise
+            logger.info("stale Turso stream on commit; connection will be recycled")
+            self._fresh_connection()
 
     async def execute(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
         async with self.lock:
@@ -53,7 +87,7 @@ class PooledConnection:
     async def execute_write(self, sql: str, params: tuple = ()) -> None:
         async with self.lock:
             await asyncio.to_thread(self._exec, sql, params)
-            await asyncio.to_thread(self.conn.commit)
+            await asyncio.to_thread(self._commit)
 
 
 class Database:
