@@ -70,7 +70,7 @@ export function RegisterForm() {
 
     if (result.ok) {
       toast.success("Workspace created. Welcome to VITALORA.");
-      router.push("/dashboard");
+      router.push("/overview");
       return;
     }
 

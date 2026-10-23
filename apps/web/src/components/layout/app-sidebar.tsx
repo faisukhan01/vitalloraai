@@ -42,7 +42,7 @@ import { initials } from "@/lib/utils-api";
 import { useAuthStore } from "@/stores/auth-store";
 
 const NAV_ITEMS = [
-  { title: "Dashboard", url: "/dashboard", icon: LayoutDashboard },
+  { title: "Overview", url: "/overview", icon: LayoutDashboard },
   { title: "AI Receptionists", url: "/receptionists", icon: Bot },
   { title: "Appointments", url: "/appointments", icon: CalendarDays },
   { title: "Voice Lab", url: "/voice-lab", icon: Mic },
@@ -77,7 +77,7 @@ export function AppSidebar() {
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton asChild size="lg" tooltip="Vitalora AI">
-              <Link href="/dashboard" aria-label="Vitalora AI — go to dashboard">
+              <Link href="/overview" aria-label="Vitalora AI — go to overview">
                 <BrandMark size="sm" />
               </Link>
             </SidebarMenuButton>
