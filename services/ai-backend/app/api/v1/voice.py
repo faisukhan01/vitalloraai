@@ -12,6 +12,7 @@ session lifecycle (high-frequency, not a configuration change).
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 from contextlib import suppress
@@ -346,6 +347,13 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                     await _persist_message(session_id, principal.organization_id, "system", "stt_error")
                     await websocket.send_json({"type": "error", "message": "Speech recognition failed. Please try again."})
                     continue
+                if not user_text and len(audio_b64) > 20_000:
+                    # Substantial audio but no transcript: transient recognizer
+                    # hiccups do happen — one honest retry before giving up.
+                    log_extra(ws_logger, logging.WARNING, "stt empty on real audio — retrying once", audio_b64_len=len(audio_b64))
+                    with suppress(ProviderError):
+                        await asyncio.sleep(0.15)
+                        user_text = await get_stt().transcribe(audio_b64, language)  # type: ignore[arg-type]
                 log_extra(ws_logger, logging.INFO, "stt done", chars=len(user_text), ms=int((_time.perf_counter() - t0) * 1000))
                 await _record_usage(principal.organization_id, session_id, "stt_seconds", get_stt().name, 3.0)
 
