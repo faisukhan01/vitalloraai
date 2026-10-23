@@ -39,7 +39,11 @@ const MAX_TTS_TEXT_CHARS = 50_000; // guardrail: ~53 provider calls worst case
 
 // Transient provider failures worth one honest retry (SDK message embeds status).
 const RETRYABLE_PROVIDER_STATUS_RE = /API request failed with status (?:429|500|502|503)\b/;
-const PROVIDER_RETRY_DELAYS_MS = [1_200, 3_000] as const;
+// Retry backoff with randomized jitter: consecutive voice-pipeline calls that
+// burst together would otherwise retry in lockstep and re-trigger the same
+// provider 429 window. Jitter spreads the retries across ~1-2s and ~2-4s.
+const PROVIDER_RETRY_DELAYS_MS = [900, 2_200] as const;
+const PROVIDER_RETRY_JITTER_MS = 700;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -135,8 +139,9 @@ async function withProviderRetries<T>(fn: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= PROVIDER_RETRY_DELAYS_MS.length; attempt++) {
     if (attempt > 0) {
-      const delay = PROVIDER_RETRY_DELAYS_MS[attempt - 1] ?? 1_000;
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      const base = PROVIDER_RETRY_DELAYS_MS[attempt - 1] ?? 1_000;
+      const jitter = Math.floor(Math.random() * PROVIDER_RETRY_JITTER_MS);
+      await new Promise((resolve) => setTimeout(resolve, base + jitter));
     }
     try {
       return await fn();

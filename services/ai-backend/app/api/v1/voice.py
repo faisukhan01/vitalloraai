@@ -121,12 +121,15 @@ async def start_voice_session(
         if greeting_text:
             with suppress(ProviderError, Exception):
                 await get_tts().synthesize(greeting_text, voice=voice, speed=speed)
-        # Provider rate-limits concurrent/bursty synthesis (429): space the
-        # warm calls out so warming never steals budget from live turns.
-        for line in (*_ACK_LINES, _RETRY_SAY):
+        # Warm ONLY the first ack line + the retry phrase: the provider
+        # throttles bursts, and a full ack-line sweep right at session start
+        # burns rate budget exactly when the caller's first turn needs it.
+        # The remaining ack lines warm opportunistically via the instant-ack
+        # probe (cache misses simply skip the ack).
+        for line in (_ACK_LINES[0], _RETRY_SAY):
             with suppress(ProviderError, Exception):
                 await get_tts().synthesize(line, voice=voice, speed=speed)
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.2)
 
     _bg(_warm())
     return VoiceSessionStartResponse(session=session, greeting_text=greeting_text)
@@ -388,9 +391,12 @@ def _split_speech_groups(text: str) -> list[str]:
 async def _speak_stream_and_send(ws: WebSocket, text: str, voice: str, speed: float) -> None:
     """Speak a reply sentence-group by sentence-group.
 
-    Every group is sent to the browser the moment its audio exists, so the
-    caller hears the first sentence while later groups are still synthesizing.
-    Turns a 3-16s silent wait into ~1-2s of time-to-first-audio.
+    All groups are synthesized CONCURRENTLY and sent in order the moment each
+    exists, so the caller hears the first sentence as early as possible and the
+    remaining sentences follow with zero synthesis gap (the previous serial
+    implementation left 1.5-2.5 s of silence between sentences). Concurrency is
+    capped at 2 because the provider rate-limits bursts (429), and a 429 on a
+    later group is invisible while group 1 is still playing.
     """
     import time as _time
 
@@ -402,16 +408,31 @@ async def _speak_stream_and_send(ws: WebSocket, text: str, voice: str, speed: fl
     await ws.send_json({"type": "status", "stage": "speaking"})
     t0 = _time.perf_counter()
     total_chars = 0
-    for group in groups:
+    sem = asyncio.Semaphore(2)
+
+    async def _synth(group: str) -> tuple[str, str]:
+        async with sem:
+            return await get_tts().synthesize(group, voice=voice, speed=speed)
+
+    tasks = [asyncio.ensure_future(_synth(group)) for group in groups]
+    failed = False
+    for i, task in enumerate(tasks):
         try:
-            audio_b64, fmt = await get_tts().synthesize(group, voice=voice, speed=speed)
+            audio_b64, fmt = await task
         except ProviderError:
             if total_chars == 0:
+                # Nothing has been spoken yet: surface the failure so the
+                # caller gets the error path instead of silence.
+                for pending in tasks[i + 1:]:
+                    pending.cancel()
                 raise
-            log_extra(ws_logger, logging.WARNING, "tts stream group failed mid-reply", chars=len(group))
-            break
-        total_chars += len(group)
+            failed = True
+            log_extra(ws_logger, logging.WARNING, "tts stream group failed mid-reply", group=i, chars=len(groups[i]))
+            continue
+        total_chars += len(groups[i])
         await ws.send_json({"type": "audio", "format": fmt, "data": audio_b64})
+    if failed and total_chars == 0:
+        raise ProviderError("Voice synthesis failed.")
     _bg(_record_usage(ws.state.org_id, ws.state.session_id, "tts_chars", ws.state.tts_provider, total_chars))
     log_extra(ws_logger, logging.INFO, "tts stream delivered", chars=total_chars, groups=len(groups), ms=int((_time.perf_counter() - t0) * 1000))
 
@@ -501,6 +522,13 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                 continue
 
             # ── 1) Speech recognition ────────────────────────────────────
+            # The instant acknowledgment ('Mm-hmm' / 'One moment') is kicked
+            # off in the BACKGROUND before transcription so it overlaps the
+            # STT round-trip: the caller hears it ~0.4 s sooner, while the
+            # recognizer is still working. Only fires when the ack audio is
+            # already cached (probe ~1ms) — otherwise it is skipped silently.
+            if audio_b64 is not None:
+                _bg(_speak_instant_ack(websocket, voice_id, speed))
             if user_text is None:
                 await websocket.send_json({"type": "status", "stage": "transcribing"})
                 import time as _time
@@ -535,12 +563,6 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
             # query inside run_turn deliberately covers only PREVIOUS turns —
             # the current utterance is appended to the prompt explicitly).
             _bg(_persist_message(session_id, principal.organization_id, "user", user_text))
-
-            # ── 1.5) Instant acknowledgment (voice turns only) ───────────
-            # Speaks a pre-warmed 'Mm-hmm'/'One moment' NOW while the LLM and
-            # the answer's TTS are still ahead of us. Skipped for typed input.
-            if user_text is not None and audio_b64 is not None:
-                await _speak_instant_ack(websocket, voice_id, speed)
 
             # ── 2) Orchestration (safety + RAG + tools) ──────────────────
             await websocket.send_json({"type": "status", "stage": "thinking"})

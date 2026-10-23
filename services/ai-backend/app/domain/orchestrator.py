@@ -135,8 +135,12 @@ CLINIC FACTS:
 - Phone: {clinic.get('phone') or 'not provided'}
 - Opening hours: {clinic_hours}
 {knowledge_text}
-BOOKING RULES:
-1. Identify the service and preferred date. 2. Call get_provider_availability. 3. Offer 1-3 concrete options. 4. Collect the caller's full name (and phone if given). 5. Repeat ALL details back and get explicit confirmation ("yes"). 6. Call create_appointment. 7. Only after the tool returns booked:true, confirm to the caller - never before.
+BOOKING RULES (each extra tool call adds seconds of silence for the caller - minimize them):
+1. Identify the service and preferred date from what the caller said.
+2. Call get_provider_availability ONCE - a single call already covers every provider for that date. NEVER repeat a tool call with the same arguments in the same turn.
+3. In ONE reply, offer 1-3 concrete options and collect the caller's full name (and phone if given).
+4. Repeat ALL details back and get explicit confirmation ("yes").
+5. Call create_appointment. Only after the tool returns booked:true, confirm to the caller - never before.
 
 MEDICAL SAFETY (non-negotiable):
 - You are NOT a diagnostic system. Do not interpret symptoms, do not prescribe medication, do not give treatment advice.
@@ -145,6 +149,7 @@ MEDICAL SAFETY (non-negotiable):
 
 TOOL PROTOCOL:
 {TOOL_DESCRIPTIONS}
+Call at most ONE tool per response, and only when live data is genuinely needed. For small talk, thanks, goodbyes and follow-ups that need no live data, reply {{"say": ...}} immediately - never call tools for general conversation.
 To call a tool, respond with ONLY a JSON object: {{"tool": "<name>", "arguments": {{...}}}}
 After a tool result comes back (a message starting with TOOL_RESULT), continue: either call another tool or reply with ONLY {{"say": "<what you will speak>"}}.
 Every non-tool response must be exactly {{"say": "..."}}. Plain text without JSON is not acceptable.
@@ -277,11 +282,17 @@ async def run_turn(
     tool_calls_made: list[dict[str, Any]] = []
     outcome_hint: str | None = None
 
-    for _ in range(MAX_TOOL_ITERATIONS + 1):
+    for iteration in range(MAX_TOOL_ITERATIONS + 1):
+        # Pace consecutive LLM calls: the provider throttles short bursts and a
+        # 429 costs 1-4s of retry backoff, so a small gap between the tool-loop
+        # round-trips is cheaper than the burst it prevents.
+        if iteration > 0:
+            await _asyncio.sleep(0.3)
         raw = await llm.chat(messages, temperature=0.4, max_tokens=VOICE_MAX_TOKENS)
         parsed = _extract_json(raw)
         if parsed is None:
             # Model broke protocol: one corrective retry with a strict reminder.
+            await _asyncio.sleep(0.3)  # pace: avoid back-to-back provider bursts
             messages.append({"role": "assistant", "content": raw[:500]})
             messages.append({"role": "user", "content": 'Respond with valid JSON only: {"tool": ...} or {"say": "..."}'})
             raw = await llm.chat(messages, temperature=0.2, max_tokens=VOICE_MAX_TOKENS)

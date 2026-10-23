@@ -98,7 +98,7 @@ TOOL_REGISTRY: dict[str, type[BaseModel]] = {
 TOOL_DESCRIPTIONS = """Available tools (call at most one per response):
 - get_clinic_information: address, phone, opening hours of the clinic. Use for "where are you", "when are you open".
 - get_services: list of services the clinic offers with durations and prices.
-- get_provider_availability {"date": "YYYY-MM-DD", "service_name"?: string, "days"?: 1-7}: free appointment slots. ALWAYS check availability before offering any time.
+- get_provider_availability {"date": "YYYY-MM-DD", "service_name"?: string, "days"?: 1-7}: free appointment slots across ALL providers in one call. ALWAYS check availability before offering any time, but call it only ONCE per turn.
 - search_appointments {"patient_phone"?: string, "patient_name"?: string}: find existing appointments (needed before rescheduling or cancelling).
 - create_appointment {"patient_name": string, "patient_phone"?: string, "service_name": string, "provider_name"?: string, "date": "YYYY-MM-DD", "time": "HH:MM"}: book. Only after the caller confirmed ALL details.
 - reschedule_appointment {"appointment_id": string, "date": "YYYY-MM-DD", "time": "HH:MM"}: move an existing appointment.
