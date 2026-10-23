@@ -35,9 +35,10 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 4
 MAX_HISTORY_MESSAGES = 12
-# Voice latency: replies are spoken (2-3 short sentences), so a generous-but-
-# bounded token budget cuts generation time measurably and prevents rambling.
-VOICE_MAX_TOKENS = 280
+# Voice latency: short spoken replies synthesize faster (TTS cost is roughly
+# linear in characters), need fewer synthesis requests, and sound natural on
+# a phone call. 220 tokens comfortably covers 2 short sentences.
+VOICE_MAX_TOKENS = 220
 
 LANGUAGE_NAMES = {"en": "English", "ur": "Urdu (اردو)", "hi": "Hindi (हिन्दी)", "ar": "Arabic (العربية)"}
 
@@ -124,7 +125,7 @@ IDENTITY AND HONESTY (non-negotiable):
 
 LANGUAGE:
 - Respond ONLY in {lang_name}, no matter which language the caller uses.
-- Keep spoken answers SHORT: at most 2-3 sentences. This is a phone conversation.
+- Keep spoken answers SHORT: at most 2 short sentences (under 40 words). This is a phone conversation.
 
 YOUR CAPABILITIES:
 {chr(10).join(capabilities_text) if capabilities_text else "- General conversation only."}
@@ -283,16 +284,17 @@ async def run_turn(
     outcome_hint: str | None = None
 
     for iteration in range(MAX_TOOL_ITERATIONS + 1):
-        # Pace consecutive LLM calls: the provider throttles short bursts and a
-        # 429 costs 1-4s of retry backoff, so a small gap between the tool-loop
-        # round-trips is cheaper than the burst it prevents.
+        # Pace consecutive LLM calls: a small gap between the tool-loop
+        # round-trips avoids back-to-back provider bursts. Kept short — each
+        # LLM call already takes ~0.7-1 s, which naturally spaces requests,
+        # and every 100 ms saved here comes straight off the caller's wait.
         if iteration > 0:
-            await _asyncio.sleep(0.3)
+            await _asyncio.sleep(0.12)
         raw = await llm.chat(messages, temperature=0.4, max_tokens=VOICE_MAX_TOKENS)
         parsed = _extract_json(raw)
         if parsed is None:
             # Model broke protocol: one corrective retry with a strict reminder.
-            await _asyncio.sleep(0.3)  # pace: avoid back-to-back provider bursts
+            await _asyncio.sleep(0.12)  # pace: avoid back-to-back provider bursts
             messages.append({"role": "assistant", "content": raw[:500]})
             messages.append({"role": "user", "content": 'Respond with valid JSON only: {"tool": ...} or {"say": "..."}'})
             raw = await llm.chat(messages, temperature=0.2, max_tokens=VOICE_MAX_TOKENS)

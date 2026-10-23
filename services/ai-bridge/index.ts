@@ -35,6 +35,22 @@ const TTS_PROVIDER_CHAR_LIMIT = 1024; // hard ZAI TTS constraint per request
 const TTS_CHUNK_TARGET = 950; // chunk below the provider limit, on sentence bounds
 const TTS_MIN_CHUNK_CUT = 40; // never emit a tiny leading chunk
 const TTS_CHUNK_CONCURRENCY = 1; // provider 429s concurrent TTS; sequential is reliable
+const TTS_MIN_START_GAP_MS = 350; // global pacer between provider TTS call starts
+let ttsLastStartAt = 0;
+
+/**
+ * Enforce the global minimum gap between provider TTS call starts.
+ * Single-threaded event loop: the timestamp is updated synchronously before
+ * any await, so overlapping callers receive staggered start times.
+ */
+async function pacedTtsStart(): Promise<void> {
+  const now = Date.now();
+  const earliest = ttsLastStartAt + TTS_MIN_START_GAP_MS;
+  ttsLastStartAt = Math.max(now, earliest);
+  if (earliest > now) {
+    await new Promise((resolve) => setTimeout(resolve, earliest - now));
+  }
+}
 const MAX_TTS_TEXT_CHARS = 50_000; // guardrail: ~53 provider calls worst case
 
 // Transient provider failures worth one honest retry (SDK message embeds status).
@@ -42,8 +58,8 @@ const RETRYABLE_PROVIDER_STATUS_RE = /API request failed with status (?:429|500|
 // Retry backoff with randomized jitter: consecutive voice-pipeline calls that
 // burst together would otherwise retry in lockstep and re-trigger the same
 // provider 429 window. Jitter spreads the retries across ~1-2s and ~2-4s.
-const PROVIDER_RETRY_DELAYS_MS = [900, 2_200] as const;
-const PROVIDER_RETRY_JITTER_MS = 700;
+const PROVIDER_RETRY_DELAYS_MS = [600, 1_600, 3_200] as const;
+const PROVIDER_RETRY_JITTER_MS = 400;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -617,6 +633,11 @@ async function synthesizeChunk(
       `TTS chunk exceeds provider limit (${chunk.length} > ${TTS_PROVIDER_CHAR_LIMIT} chars)`,
     );
   }
+  // Process-wide pacer: keep a minimum gap between the STARTS of consecutive
+  // provider TTS calls. The endpoint throttles bursts (429 -> ~0.5-2 s retry
+  // backoff), and smoothing overlapping requests is far cheaper than the
+  // retries it prevents. Sequential traffic is unaffected.
+  await pacedTtsStart();
   // The SDK returns the raw fetch Response for TTS.
   const response = (await withTimeout(
     withProviderRetries(() =>

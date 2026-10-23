@@ -348,21 +348,45 @@ async def _speak_instant_ack(ws: WebSocket, voice: str, speed: float) -> None:
 
 _SENTENCE_END_RE = re.compile(r"[.!?。！？](?=\s|$)")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:，；：])\s+")
-_FIRST_GROUP_MAX = 220   # first spoken group: one short sentence for fastest first audio
-_GROUP_MAX = 700         # later groups: several sentences per synthesis request
+# Measured provider synthesis cost: ~0.7 s base + ~20 ms/char, with heavy
+# tail latency for long inputs (a 144-char chunk once took 10.9 s), and ANY
+# concurrency triggers 429 rate limiting. Strategy: SENTENCE-level streaming —
+# each group is one sentence (~1.5-2.5 s to synthesize, 2.7-5 s to play), so
+# sequential synthesis stays AHEAD of playback after the first sentence and a
+# slow provider call never leaves the caller in silence.
+_SINGLE_TTS_MAX = 80    # one very short phrase: a single request beats splitting
+_FIRST_GROUP_MAX = 90   # first spoken group: one short sentence for fastest first audio
+_REST_GROUP_MAX = 110   # later groups: small enough to synthesize in ~2-3 s
+_GROUP_MAX = 700        # hard cap: only for pathological unpunctuated text
+
+
+def _lead_clause(sentence: str, max_len: int) -> tuple[str, str] | None:
+    """Split a long sentence into (short lead clause, remainder) for fast TTS."""
+    clauses = [c for c in _CLAUSE_SPLIT_RE.split(sentence) if c]
+    if len(clauses) < 2:
+        return None
+    lead: list[str] = []
+    length = 0
+    cut = 0
+    for i, clause in enumerate(clauses):
+        lead.append(clause)
+        length += len(clause) + 1
+        cut = i + 1
+        if length >= 40:
+            break
+    if cut < len(clauses) and length <= max_len:
+        return " ".join(lead), " ".join(clauses[cut:])
+    return None
 
 
 def _split_speech_groups(text: str) -> list[str]:
     """Split a reply into speakable groups.
 
-    The first group is a single short sentence so the caller hears the
-    receptionist begin answering as early as possible; the remainder is
-    batched into larger groups (fewer synthesis requests overall).
-
-    Long single sentences (e.g. "Open Monday 9-5, Saturday 10-2, closed
-    Sunday.") have no sentence-end punctuation, so they are split on clause
-    boundaries instead — a spoken clause break sounds natural and the first
-    clause starts playing ~1.5-2 s sooner than whole-sentence synthesis.
+    The first group is a single SHORT sentence (or leading clause) so the
+    caller hears the receptionist begin answering as early as possible.
+    Remaining groups are single sentences (ultra-short ones merged) — small
+    synthesis requests have predictable ~1.5-2.5 s latency, and sequential
+    synthesis of the next sentence overlaps playback of the previous one.
     """
     text = text.strip()
     if not text:
@@ -377,51 +401,66 @@ def _split_speech_groups(text: str) -> list[str]:
     if not sentences:
         return [text]
 
-    # Long sentenceless reply: cut a short leading clause group for fast TTS.
-    if len(sentences) == 1 and len(sentences[0]) > 120:
-        clauses = [c for c in _CLAUSE_SPLIT_RE.split(sentences[0]) if c]
-        if len(clauses) > 1:
-            first: list[str] = []
-            length = 0
-            cut = 0
-            for i, clause in enumerate(clauses):
-                first.append(clause)
-                length += len(clause) + 1
-                cut = i + 1
-                if length >= 50:
-                    break
-            if cut < len(clauses) and length <= 130:
-                return [" ".join(first), " ".join(clauses[cut:])]
+    # Short single sentence: already optimal as one request.
+    if len(sentences) == 1:
+        if len(sentences[0]) <= _FIRST_GROUP_MAX:
+            return [text]
+        split = _lead_clause(sentences[0], 130)
+        return [split[0], split[1]] if split else [text]
 
     first = sentences[0]
+    rest = sentences[1:]
+    # Very long first sentence: lead with its opening clause instead.
     if len(first) > _FIRST_GROUP_MAX:
-        # Very long opening sentence: fall back to the whole-text path.
-        return [text]
-    groups = [first]
+        split = _lead_clause(first, _FIRST_GROUP_MAX + 40)
+        if split:
+            first, rest = split[0], [split[1], *rest]
 
-    rest: list[str] = []
-    for s in sentences[1:]:
-        if rest and sum(len(x) for x in rest) + len(s) + 1 > _GROUP_MAX:
-            groups.append(" ".join(rest))
-            rest = [s]
+    groups = [first]
+    batch: list[str] = []
+    for s in rest:
+        if batch and sum(len(x) for x in batch) + len(s) + 1 > _REST_GROUP_MAX:
+            groups.append(" ".join(batch))
+            batch = [s]
         else:
-            rest.append(s)
-    if rest:
-        groups.append(" ".join(rest))
-    return groups
+            batch.append(s)
+    if batch:
+        groups.append(" ".join(batch))
+    # Pathological long group (no punctuation anywhere): hard-split it so no
+    # single synthesis request becomes a multi-second latency bomb.
+    final: list[str] = []
+    for g in groups:
+        if len(g) <= _GROUP_MAX:
+            final.append(g)
+            continue
+        words = g.split(" ")
+        cur: list[str] = []
+        n = 0
+        for w in words:
+            cur.append(w)
+            n += len(w) + 1
+            if n >= _GROUP_MAX:
+                final.append(" ".join(cur))
+                cur, n = [], 0
+        if cur:
+            final.append(" ".join(cur))
+    return final
 
 
 async def _speak_stream_and_send(ws: WebSocket, text: str, voice: str, speed: float) -> None:
-    """Speak a reply sentence-group by sentence-group.
+    """Speak a reply with fast first audio and zero provider bursts.
 
-    All groups are synthesized CONCURRENTLY and sent in order the moment each
-    exists, so the caller hears the first sentence as early as possible and the
-    remaining sentences follow with zero synthesis gap (the previous serial
-    implementation left 1.5-2.5 s of silence between sentences). Concurrency is
-    capped at 2 because the provider rate-limits bursts (429), and a 429 on a
-    later group is invisible while group 1 is still playing.
+    Very short phrases go out as ONE synthesis request. Anything longer is
+    split so a SHORT leading group (first sentence / opening clause, ~1.3-1.9 s
+    to synthesize) starts playing as early as possible, while later groups are
+    synthesized strictly SEQUENTIALLY — each finishes while the previous audio
+    is still playing, and no concurrency means no provider 429 backoffs.
     """
     import time as _time
+
+    if len(text.strip()) <= _SINGLE_TTS_MAX:
+        await _speak_and_send(ws, text, voice, speed)
+        return
 
     groups = _split_speech_groups(text)
     if len(groups) <= 1:
@@ -431,7 +470,7 @@ async def _speak_stream_and_send(ws: WebSocket, text: str, voice: str, speed: fl
     await ws.send_json({"type": "status", "stage": "speaking"})
     t0 = _time.perf_counter()
     total_chars = 0
-    sem = asyncio.Semaphore(2)
+    sem = asyncio.Semaphore(1)  # sequential: concurrent TTS triggers provider 429s
 
     async def _synth(group: str) -> tuple[str, str]:
         async with sem:
