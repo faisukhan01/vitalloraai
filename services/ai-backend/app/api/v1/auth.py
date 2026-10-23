@@ -53,9 +53,26 @@ def _slugify(value: str) -> str:
     return slug[:80] or "org"
 
 
+def _cookie_params(request: Request) -> dict:
+    """Cookie flags adapt to the request context.
+
+    Preview panels frequently embed the app in a cross-site iframe served over
+    HTTPS; browsers reject SameSite=Lax cookies in that context, which breaks
+    session restore after sign-in. Over HTTPS we emit SameSite=None; Secure —
+    accepted in iframes and in normal top-level browsing alike. Plain HTTP
+    (local development) keeps the configured Lax default.
+    """
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    is_https = forwarded_proto == "https" or request.url.scheme == "https"
+    if is_https or settings.cookie_samesite == "none":
+        return {"secure": True, "samesite": "none"}
+    return {"secure": settings.cookie_secure, "samesite": settings.cookie_samesite}
+
+
 async def _issue_session(
     response: Response,
     *,
+    request: Request,
     user_id: str,
     org_id: str,
     role: str,
@@ -73,10 +90,9 @@ async def _issue_session(
         key=REFRESH_COOKIE,
         value=refresh,
         httponly=True,
-        secure=settings.cookie_secure,
-        samesite=settings.cookie_samesite,
         max_age=settings.refresh_token_expire_days * 24 * 3600,
         path="/",
+        **_cookie_params(request),
     )
     await db.write(
         "INSERT INTO audit_events (id, organization_id, actor_user_id, actor_type, actor_display, action, ip_hash, created_at) "
@@ -133,6 +149,7 @@ async def register_organization(payload: RegisterOrgRequest, request: Request, r
 
     tokens = await _issue_session(
         response,
+        request=request,
         user_id=user_id,
         org_id=org_id,
         role="owner",
@@ -199,6 +216,7 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
     await db.write("UPDATE users SET last_login_at = ? WHERE id = ?", (utc_now_iso(), user["id"]))
     tokens = await _issue_session(
         response,
+        request=request,
         user_id=user["id"],
         org_id=user["organization_id"],
         role=user["role"],
@@ -253,10 +271,9 @@ async def refresh_session(request: Request, response: Response, payload: Refresh
         key=REFRESH_COOKIE,
         value=new_refresh,
         httponly=True,
-        secure=settings.cookie_secure,
-        samesite=settings.cookie_samesite,
         max_age=settings.refresh_token_expire_days * 24 * 3600,
         path="/",
+        **_cookie_params(request),
     )
     return AuthTokens(access_token=access, expires_in=settings.access_token_expire_minutes * 60)
 

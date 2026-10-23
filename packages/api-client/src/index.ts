@@ -80,6 +80,17 @@ export class ApiError extends Error {
 
 type Listener = () => void;
 
+/**
+ * sessionStorage key for the short-lived access token.
+ *
+ * Purpose: preview panels (and privacy-restricted browsers) may block the
+ * httpOnly refresh cookie, so a page reload would otherwise sign the user
+ * out right after signing in. We mirror the 30-minute access token into
+ * sessionStorage — per-tab, cleared when the tab closes — as a bootstrap
+ * fallback. The long-lived refresh token itself is NEVER stored here.
+ */
+const SESSION_TOKEN_KEY = "vitalora_at";
+
 export class ApiClient {
   private accessToken: string | null = null;
   private refreshPromise: Promise<boolean> | null = null;
@@ -87,10 +98,26 @@ export class ApiClient {
 
   setToken(token: string | null) {
     this.accessToken = token;
+    if (typeof window === "undefined") return;
+    try {
+      if (token) window.sessionStorage.setItem(SESSION_TOKEN_KEY, token);
+      else window.sessionStorage.removeItem(SESSION_TOKEN_KEY);
+    } catch {
+      // Storage unavailable (private mode) — in-memory token still works.
+    }
   }
 
   getToken() {
     return this.accessToken;
+  }
+
+  private readStoredToken(): string | null {
+    if (typeof window === "undefined") return null;
+    try {
+      return window.sessionStorage.getItem(SESSION_TOKEN_KEY);
+    } catch {
+      return null;
+    }
   }
 
   onUnauthorized(listener: Listener) {
@@ -127,6 +154,8 @@ export class ApiClient {
       if (refreshed) {
         return this.rawRequest<T>(method, path, { ...opts, retryOn401: false });
       }
+      // Session is definitively gone — drop any persisted fallback token.
+      this.setToken(null);
       this.unauthorizedListeners.forEach((l) => l());
     }
 
@@ -149,6 +178,7 @@ export class ApiClient {
         try {
           const tokens = await this.rawRequest<AuthTokens>("POST", "/auth/refresh", { auth: false, retryOn401: false });
           this.accessToken = tokens.access_token;
+          this.setToken(tokens.access_token);
           return true;
         } catch {
           return false;
@@ -166,7 +196,7 @@ export class ApiClient {
       json: { email, password, org_slug: orgSlug || null },
       auth: false,
     });
-    this.accessToken = res.access_token;
+    this.setToken(res.access_token);
     return res;
   }
 
@@ -175,7 +205,7 @@ export class ApiClient {
     admin: { name: string; email: string; password: string };
   }): Promise<RegisterOrgResponse> {
     const res = await this.rawRequest<RegisterOrgResponse>("POST", "/auth/register-org", { json: payload, auth: false });
-    this.accessToken = res.access_token;
+    this.setToken(res.access_token);
     return res;
   }
 
@@ -195,17 +225,29 @@ export class ApiClient {
     const res = await this.rawRequest<{ message: string }>("POST", "/auth/change-password", {
       json: { current_password: currentPassword, new_password: newPassword },
     });
-    this.accessToken = null;
+    this.setToken(null);
     return res;
   }
 
   async bootstrapSession(): Promise<MeResponse | null> {
     // Refresh-cookie bootstrap: returns profile if a valid session cookie exists.
     const ok = await this.tryRefresh();
-    if (!ok) return null;
+    if (ok) {
+      try {
+        return await this.me();
+      } catch {
+        return null;
+      }
+    }
+    // Cookie blocked or expired (e.g. preview iframe / strict privacy mode):
+    // fall back to the per-tab access token captured at sign-in.
+    const stored = this.readStoredToken();
+    if (!stored) return null;
+    this.accessToken = stored;
     try {
       return await this.me();
     } catch {
+      this.setToken(null);
       return null;
     }
   }

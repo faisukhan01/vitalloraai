@@ -3,6 +3,7 @@ import { CalendarCheck2, Headset, Languages } from "lucide-react";
 
 import { BrandMark } from "@/components/brand-mark";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
+import { IframeNotice } from "@/components/layout/iframe-notice";
 
 const PANEL_POINTS = [
   {
@@ -89,7 +90,10 @@ export default function AuthLayout({
           <ThemeToggle />
         </div>
         <main className="flex flex-1 items-start justify-center px-4 py-8 sm:items-center sm:px-6 sm:py-10">
-          <div className="w-full max-w-md">{children}</div>
+          <div className="w-full max-w-md">
+            <IframeNotice />
+            {children}
+          </div>
         </main>
       </div>
     </div>
