@@ -118,18 +118,22 @@ async def start_voice_session(
     speed = float(receptionist["speaking_speed"] or 1.0)
 
     async def _warm() -> None:
+        # One provider call every ~1.2s — never a burst. The greeting goes
+        # first because the WS "greet" frame lands within a second of session
+        # creation; every later fast path (ack, retry, busy) becomes a ~0ms
+        # cache hit within a few seconds.
         if greeting_text:
             with suppress(ProviderError, Exception):
                 await get_tts().synthesize(greeting_text, voice=voice, speed=speed)
-        # Warm ONLY the first ack line + the retry phrase: the provider
+        # Warm ONLY the first ack line + the retry/busy phrases: the provider
         # throttles bursts, and a full ack-line sweep right at session start
         # burns rate budget exactly when the caller's first turn needs it.
         # The remaining ack lines warm opportunistically via the instant-ack
         # probe (cache misses simply skip the ack).
         for line in (_ACK_LINES[0], _RETRY_SAY, _BUSY_SAY):
+            await asyncio.sleep(1.2)
             with suppress(ProviderError, Exception):
                 await get_tts().synthesize(line, voice=voice, speed=speed)
-            await asyncio.sleep(1.2)
 
     _bg(_warm())
     return VoiceSessionStartResponse(session=session, greeting_text=greeting_text)
@@ -348,20 +352,37 @@ async def _speak_instant_ack(ws: WebSocket, voice: str, speed: float) -> None:
 
 _SENTENCE_END_RE = re.compile(r"[.!?。！？](?=\s|$)")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:，；：])\s+")
-# Measured provider synthesis cost: ~0.7 s base + ~20 ms/char, with heavy
-# tail latency for long inputs (a 144-char chunk once took 10.9 s), and ANY
-# concurrency triggers 429 rate limiting. Strategy: SENTENCE-level streaming —
-# each group is one sentence (~1.5-2.5 s to synthesize, 2.7-5 s to play), so
-# sequential synthesis stays AHEAD of playback after the first sentence and a
-# slow provider call never leaves the caller in silence.
-_SINGLE_TTS_MAX = 80    # one very short phrase: a single request beats splitting
-_FIRST_GROUP_MAX = 90   # first spoken group: one short sentence for fastest first audio
-_REST_GROUP_MAX = 110   # later groups: small enough to synthesize in ~2-3 s
+# Measured provider synthesis cost (2026-10 probe): a 32-char request takes
+# ~1.4 s while a 68-char request jumps to ~3.8 s — cost explodes with length,
+# so the FIRST spoken group must stay tiny (~25-45 chars) for fast first
+# audio. Later groups synthesize sequentially while earlier audio plays.
+_SINGLE_TTS_MAX = 55    # one very short phrase: a single request beats splitting
+_FIRST_GROUP_MAX = 45   # first spoken group: one short sentence for fastest first audio
+_REST_GROUP_MAX = 85    # later groups: small enough to synthesize in ~2-3 s
+_HARD_FIRST_MAX = 90    # no-clause single sentences: hard word-split above this
 _GROUP_MAX = 700        # hard cap: only for pathological unpunctuated text
+# Periods that do NOT end a sentence (abbreviations, time formats).
+_ABBREV_END_RE = re.compile(
+    r"\b(?:dr|mr|mrs|ms|prof|sr|jr|st|vs|etc|approx|dept|est|min|max|inc|ltd|a\.m|p\.m|e\.g|i\.e|no)\.$",
+    re.IGNORECASE,
+)
+
+
+def _hard_word_split(text: str, target: int) -> tuple[str, str]:
+    """Split long unpunctuated text at the last word boundary before target."""
+    cut = text.rfind(" ", 0, target)
+    if cut < 20:
+        cut = target
+    return text[:cut].rstrip(), text[cut:].lstrip()
 
 
 def _lead_clause(sentence: str, max_len: int) -> tuple[str, str] | None:
-    """Split a long sentence into (short lead clause, remainder) for fast TTS."""
+    """Split a long sentence into (short lead clause, remainder) for fast TTS.
+
+    The lead accumulates clauses only until it reaches a MINIMUM speakable
+    length (~16 chars) — a tiny, fast first synthesis request — and never
+    exceeds max_len.
+    """
     clauses = [c for c in _CLAUSE_SPLIT_RE.split(sentence) if c]
     if len(clauses) < 2:
         return None
@@ -372,7 +393,7 @@ def _lead_clause(sentence: str, max_len: int) -> tuple[str, str] | None:
         lead.append(clause)
         length += len(clause) + 1
         cut = i + 1
-        if length >= 40:
+        if length >= 16:
             break
     if cut < len(clauses) and length <= max_len:
         return " ".join(lead), " ".join(clauses[cut:])
@@ -392,12 +413,20 @@ def _split_speech_groups(text: str) -> list[str]:
     if not text:
         return []
     matches = list(_SENTENCE_END_RE.finditer(text))
-    bounds = [0] + [m.end() for m in matches] + [len(text)]
     sentences: list[str] = []
-    for i in range(len(bounds) - 1):
-        part = text[bounds[i]:bounds[i + 1]].strip()
+    start = 0
+    for m in matches:
+        seg = text[start:m.end()]
+        # Abbreviation period (Dr., a.m., etc.) — not a sentence boundary.
+        if _ABBREV_END_RE.search(seg.rstrip()):
+            continue
+        part = seg.strip()
         if part:
             sentences.append(part)
+        start = m.end()
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
     if not sentences:
         return [text]
 
@@ -405,16 +434,29 @@ def _split_speech_groups(text: str) -> list[str]:
     if len(sentences) == 1:
         if len(sentences[0]) <= _FIRST_GROUP_MAX:
             return [text]
-        split = _lead_clause(sentences[0], 130)
-        return [split[0], split[1]] if split else [text]
+        split = _lead_clause(sentences[0], _FIRST_GROUP_MAX + 40)
+        if split:
+            return [split[0], split[1]]
+        # No clause boundary anywhere: avoid a multi-second synthesis bomb.
+        if len(sentences[0]) > _HARD_FIRST_MAX:
+            a, b = _hard_word_split(sentences[0], 60)
+            return [a, b] if b else [text]
+        return [text]
 
     first = sentences[0]
     rest = sentences[1:]
+    # Ultra-short leading fragment (e.g. a stray 'Dr.' / 'Yes.'): merging with
+    # the next sentence avoids synthesizing a near-empty first group.
+    if len(first) < 16 and rest:
+        first = f"{first} {rest.pop(0)}"
     # Very long first sentence: lead with its opening clause instead.
     if len(first) > _FIRST_GROUP_MAX:
         split = _lead_clause(first, _FIRST_GROUP_MAX + 40)
         if split:
             first, rest = split[0], [split[1], *rest]
+        elif len(first) > _HARD_FIRST_MAX:
+            a, b = _hard_word_split(first, 60)
+            first, rest = a, [b, *rest] if b else rest
 
     groups = [first]
     batch: list[str] = []
@@ -563,7 +605,17 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                     await websocket.send_json({"type": "transcript", "role": "assistant", "text": greeting})
                     _bg(_persist_message(session_id, principal.organization_id, "assistant", greeting))
                     try:
-                        await _speak_stream_and_send(websocket, greeting, voice_id, speed)
+                        # The session-start warmer synthesizes the FULL greeting
+                        # text. On a warm hit this is a ~0ms cache-hit request.
+                        # On a miss the warm synthesis is still in flight — a
+                        # single full-text request here DEDUPES against it in
+                        # the bridge (same voice+speed+text key), so the
+                        # greeting never fires burst traffic. Splitting the
+                        # greeting into groups would MISS the warm key and add
+                        # 1-2 fresh provider calls — exactly the burst pattern
+                        # that trips 429 throttling (one 429 retry = 0.6-1.6 s
+                        # of dead air before the caller hears anything).
+                        await _speak_and_send(websocket, greeting, voice_id, speed)
                     except ProviderError:
                         await websocket.send_json({"type": "error", "message": "Voice synthesis failed; showing text only."})
                 await websocket.send_json({"type": "status", "stage": "listening"})

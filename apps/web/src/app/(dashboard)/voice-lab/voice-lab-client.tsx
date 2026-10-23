@@ -52,6 +52,90 @@ interface WavPacket {
   durationMs: number;
 }
 
+interface AudioChunk {
+  bytes: ArrayBuffer;
+  mime: string;
+}
+
+/** Minimal valid silent WAV (1 sample) used to unlock <audio> playback in-gesture. */
+function makeSilentWav(): ArrayBuffer {
+  const buf = new ArrayBuffer(46);
+  const v = new DataView(buf);
+  const w = (o: number, s: string) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i));
+  };
+  w(0, "RIFF");
+  v.setUint32(4, 38, true);
+  w(8, "WAVE");
+  w(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, 8000, true);
+  v.setUint32(28, 16000, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  w(36, "data");
+  v.setUint32(40, 2, true);
+  v.setInt16(44, 0, true);
+  return buf;
+}
+
+/**
+ * Unlock audio playback synchronously inside the user gesture.
+ *
+ * Browsers with strict autoplay policies (Safari, Chrome in embedded
+ * previews) only allow programmatic audio that is triggered directly by a
+ * user gesture — and a gesture EXPIRES after the first await (network calls,
+ * getUserMedia prompts). So the very first thing the Start-Call click does
+ * (before any await) is: create/resume an AudioContext, push one silent
+ * sample through it, and prime an <audio> element. Every later reply is then
+ * played through the RUNNING context (buffer sources), which is exempt from
+ * per-media autoplay checks.
+ */
+function ensureAudioUnlocked(audioCtxRef: { current: AudioContext | null }, audioElRef: { current: HTMLAudioElement | null }): void {
+  try {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (Ctx) {
+      let ctx = audioCtxRef.current;
+      if (!ctx || ctx.state === "closed") {
+        ctx = new Ctx();
+        audioCtxRef.current = ctx;
+      }
+      void ctx.resume().catch(() => undefined);
+      // One silent sample through the context marks it "gesture-unlocked".
+      const silent = ctx.createBuffer(1, 1, ctx.sampleRate);
+      const src = ctx.createBufferSource();
+      src.buffer = silent;
+      src.connect(ctx.destination);
+      src.start(0);
+    }
+  } catch {
+    /* element fallback below still applies */
+  }
+  try {
+    // Prime an <audio> element too: once an element has played inside a
+    // gesture, later programmatic play() on it is allowed (Safari rule).
+    const el = audioElRef.current ?? new Audio();
+    audioElRef.current = el;
+    el.src = URL.createObjectURL(new Blob([makeSilentWav()], { type: "audio/wav" }));
+    el.muted = true;
+    const p = el.play();
+    if (p) {
+      p.then(() => {
+        el.muted = false;
+        el.pause();
+        URL.revokeObjectURL(el.src);
+      }).catch(() => {
+        el.muted = false;
+        URL.revokeObjectURL(el.src);
+      });
+    }
+  } catch {
+    /* nothing else to try here */
+  }
+}
+
 /** Encode Float32 mono samples as a 16-bit PCM WAV ArrayBuffer. */
 function encodeWav16(samples: Float32Array, sampleRate: number): ArrayBuffer {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -176,10 +260,15 @@ export function VoiceLabClient() {
   const calibDoneRef = useRef(false);
   // Assistant-playback gating (echo-proof turn taking)
   const speakingRef = useRef(false);
-  // Sentence-streamed replies arrive as several audio messages; they must
-  // play back-to-back as a queue, not overwrite each other.
-  const audioQueueRef = useRef<string[]>([]);
+  // Sentence-streamed replies arrive as several audio messages; they are
+  // decoded and scheduled on the unlocked AudioContext as a gapless queue.
+  const audioQueueRef = useRef<AudioChunk[]>([]);
   const audioPlayingRef = useRef(false);
+  const pumpingRef = useRef(false);
+  const nextStartRef = useRef(0); // context timeline for back-to-back scheduling
+  const scheduledSrcsRef = useRef<AudioBufferSourceNode[]>([]);
+  const playbackGenRef = useRef(0); // bumped on every stop so stale callbacks no-op
+  const finishPlaybackRef = useRef<() => void>(() => undefined);
   // Low-mic hint state
   const quietMsRef = useRef(0);
   const lastTickRef = useRef(0);
@@ -200,7 +289,6 @@ export function VoiceLabClient() {
       setReceptionistId(preset.id);
       setLanguage(preset.primary_language);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receptionists]);
 
   const selected = receptionists.find((r) => r.id === receptionistId);
@@ -213,15 +301,136 @@ export function VoiceLabClient() {
   }, []);
 
   const stopAudio = useCallback(() => {
+    playbackGenRef.current += 1;
+    pumpingRef.current = false;
+    for (const s of scheduledSrcsRef.current) {
+      try {
+        s.onended = null;
+        s.stop();
+      } catch {
+        /* already stopped */
+      }
+    }
+    scheduledSrcsRef.current = [];
+    audioQueueRef.current = [];
+    nextStartRef.current = 0;
     const el = audioElRef.current;
     if (el) {
       el.pause();
-      el.currentTime = 0;
+      try {
+        el.currentTime = 0;
+      } catch {
+        /* not seekable yet */
+      }
     }
-    audioQueueRef.current.forEach((url) => URL.revokeObjectURL(url));
-    audioQueueRef.current = [];
     audioPlayingRef.current = false;
   }, []);
+
+  /**
+   * Gapless reply player.
+   *
+   * Primary path: decode each queued chunk on the gesture-unlocked
+   * AudioContext and schedule buffer sources back-to-back on the context
+   * timeline. Playback through a running context is NOT subject to per-media
+   * autoplay checks, and scheduled buffers transition without gaps.
+   * Fallback path: the primed <audio> element (also unlocked in-gesture).
+   */
+  const pumpQueue = useCallback(async () => {
+    if (pumpingRef.current) return;
+    pumpingRef.current = true;
+    const gen = playbackGenRef.current;
+    try {
+      while (audioQueueRef.current.length > 0) {
+        const ctx = audioCtxRef.current;
+        const item = audioQueueRef.current[0];
+        if (!item) break;
+        if (ctx && ctx.state === "running") {
+          let buf: AudioBuffer;
+          try {
+            buf = await ctx.decodeAudioData(item.bytes);
+          } catch {
+            audioQueueRef.current.shift(); // undecodable chunk — drop and continue
+            continue;
+          }
+          if (gen !== playbackGenRef.current) return;
+          audioQueueRef.current.shift();
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(ctx.destination);
+          const startAt = Math.max(ctx.currentTime + 0.02, nextStartRef.current);
+          src.start(startAt);
+          nextStartRef.current = startAt + buf.duration;
+          scheduledSrcsRef.current.push(src);
+          audioPlayingRef.current = true;
+          src.onended = () => {
+            scheduledSrcsRef.current = scheduledSrcsRef.current.filter((s) => s !== src);
+            if (gen !== playbackGenRef.current) return;
+            if (scheduledSrcsRef.current.length === 0 && audioQueueRef.current.length === 0 && !pumpingRef.current) {
+              audioPlayingRef.current = false;
+              finishPlaybackRef.current();
+            }
+          };
+        } else {
+          // Element fallback (no AudioContext or context suspended).
+          audioQueueRef.current.shift();
+          const el = audioElRef.current ?? new Audio();
+          audioElRef.current = el;
+          const url = URL.createObjectURL(new Blob([item.bytes], { type: item.mime }));
+          el.src = url;
+          audioPlayingRef.current = true;
+          try {
+            await el.play();
+          } catch {
+            URL.revokeObjectURL(url);
+            audioPlayingRef.current = false;
+            pumpingRef.current = false;
+            if (gen === playbackGenRef.current) {
+              // Do NOT drop the queue: a tap anywhere re-resumes audio and
+              // re-pumps what is still pending (see global pointerdown effect).
+              setStage("listening");
+              setErrorMsg("Tap anywhere on the page to enable sound — your receptionist is ready.");
+            }
+            return;
+          }
+          if (gen !== playbackGenRef.current) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          await new Promise<void>((resolve) => {
+            el.onended = () => resolve();
+          });
+          URL.revokeObjectURL(url);
+          if (gen !== playbackGenRef.current) return;
+        }
+      }
+    } finally {
+      pumpingRef.current = false;
+      if (gen === playbackGenRef.current && scheduledSrcsRef.current.length === 0 && audioQueueRef.current.length === 0 && audioPlayingRef.current) {
+        audioPlayingRef.current = false;
+        finishPlaybackRef.current();
+      }
+    }
+  }, []);
+
+  // Safety net: if the context somehow gets suspended mid-call, ANY tap on
+  // the page resumes it and re-pumps whatever is still queued.
+  useEffect(() => {
+    const resumeAudio = () => {
+      const ctx = audioCtxRef.current;
+      if (ctx && ctx.state === "suspended") {
+        void ctx
+          .resume()
+          .then(() => {
+            if (audioQueueRef.current.length > 0 && !audioPlayingRef.current && !pumpingRef.current) {
+              void pumpQueue();
+            }
+          })
+          .catch(() => undefined);
+      }
+    };
+    window.addEventListener("pointerdown", resumeAudio);
+    return () => window.removeEventListener("pointerdown", resumeAudio);
+  }, [pumpQueue]);
 
   // ── Microphone capture + VAD ────────────────────────────────────────────
   const sendUtterance = useCallback(
@@ -355,8 +564,13 @@ export function VoiceLabClient() {
       });
       streamRef.current = stream;
       const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const ctx = new Ctx();
-      audioCtxRef.current = ctx;
+      // Reuse the context created (and gesture-unlocked) by Start Call; only
+      // create a fresh one when the component entered keyboard-only mode.
+      let ctx = audioCtxRef.current;
+      if (!ctx || ctx.state === "closed") {
+        ctx = new Ctx();
+        audioCtxRef.current = ctx;
+      }
       if (ctx.state === "suspended") await ctx.resume().catch(() => undefined);
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
@@ -437,6 +651,10 @@ export function VoiceLabClient() {
 
   const startCall = useCallback(async () => {
     if (!receptionistId) return;
+    // MUST run synchronously inside the click gesture, before ANY await:
+    // browsers expire the gesture after the first async step, and audio can
+    // only be unlocked while the gesture is live. See ensureAudioUnlocked.
+    ensureAudioUnlocked(audioCtxRef, audioElRef);
     setErrorMsg(null);
     setMicError(null);
     setMicHint(null);
@@ -456,34 +674,7 @@ export function VoiceLabClient() {
         resetVadCalibration();
         setStage((s) => (s === "ended" || s === "error" ? s : "listening"));
       };
-
-      // Queue player: streamed reply chunks play back-to-back; the mic stays
-      // disarmed until the whole reply has finished (or the caller barges in).
-      const playNextChunk = () => {
-        const next = audioQueueRef.current.shift();
-        if (!next) {
-          audioPlayingRef.current = false;
-          finishPlayback();
-          return;
-        }
-        const el = audioElRef.current ?? new Audio();
-        audioElRef.current = el;
-        el.src = next;
-        audioPlayingRef.current = true;
-        el.onended = () => {
-          URL.revokeObjectURL(next);
-          playNextChunk();
-        };
-        void el.play().catch(() => {
-          URL.revokeObjectURL(next);
-          // Autoplay blocked: drop the queue, recover to listening with text visible.
-          stopAudio();
-          speakingRef.current = false;
-          resetVadCalibration();
-          setStage("listening");
-          setErrorMsg("Autoplay was blocked by the browser. Click anywhere on the page, then start the call again.");
-        });
-      };
+      finishPlaybackRef.current = finishPlayback;
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data as string) as {
@@ -526,12 +717,13 @@ export function VoiceLabClient() {
               const binary = atob(msg.data);
               const bytes = new Uint8Array(binary.length);
               for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-              const blob = new Blob([bytes.buffer], { type: msg.format === "mp3" ? "audio/mpeg" : "audio/wav" });
-              const url = URL.createObjectURL(blob);
               speakingRef.current = true;
               setStage("speaking");
-              audioQueueRef.current.push(url);
-              if (!audioPlayingRef.current) playNextChunk();
+              audioQueueRef.current.push({
+                bytes: bytes.buffer,
+                mime: msg.format === "mp3" ? "audio/mpeg" : "audio/wav",
+              });
+              if (!audioPlayingRef.current && !pumpingRef.current) void pumpQueue();
             }
             break;
           }
@@ -577,7 +769,7 @@ export function VoiceLabClient() {
         setErrorMsg("Could not start the call. Verify the backend and ai-bridge services are running, then try again.");
       }
     }
-  }, [addTurn, language, receptionistId, resetVadCalibration, setupMic, stopAudio]);
+  }, [addTurn, language, pumpQueue, receptionistId, resetVadCalibration, setupMic, stopAudio, stopRecording]);
 
   useEffect(() => {
     return () => {
@@ -586,7 +778,6 @@ export function VoiceLabClient() {
       const sid = sessionRef.current;
       if (sid) void api.endVoiceSession(sid, "caller_ended").catch(() => undefined);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Waveform bars animate from the live microphone RMS (genuinely audio-driven).

@@ -163,6 +163,22 @@ CONVERSATION STYLE:
 """
 
 
+def _plain_text_say(raw: str) -> str:
+    """Best-effort spoken reply from a protocol-breaking LLM response.
+
+    glm-4-plus occasionally answers in plain prose instead of the JSON tool
+    protocol. The old behaviour was a corrective second LLM round-trip —
+    ~0.6-0.9 s of dead air mid-call on a nontrivial share of turns. Instead,
+    salvage the text directly: strip code fences, a leading 'say:' label and
+    wrapping quotes. Only a truly EMPTY response justifies the retry.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r'^"?say"?\s*:\s*', "", text, flags=re.IGNORECASE).strip()
+    return text.strip('"').strip()
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     """Extract the first JSON object from an LLM response (handles fences/prose)."""
     text = text.strip()
@@ -284,22 +300,23 @@ async def run_turn(
     outcome_hint: str | None = None
 
     for iteration in range(MAX_TOOL_ITERATIONS + 1):
-        # Pace consecutive LLM calls: a small gap between the tool-loop
-        # round-trips avoids back-to-back provider bursts. Kept short — each
-        # LLM call already takes ~0.7-1 s, which naturally spaces requests,
-        # and every 100 ms saved here comes straight off the caller's wait.
-        if iteration > 0:
-            await _asyncio.sleep(0.12)
         raw = await llm.chat(messages, temperature=0.4, max_tokens=VOICE_MAX_TOKENS)
         parsed = _extract_json(raw)
         if parsed is None:
-            # Model broke protocol: one corrective retry with a strict reminder.
-            await _asyncio.sleep(0.12)  # pace: avoid back-to-back provider bursts
+            # Protocol miss. Salvage plain prose as the spoken reply instead of
+            # paying a corrective LLM round-trip (~0.7 s of silence per turn).
+            salvage = _plain_text_say(raw)
+            if salvage:
+                return OrchestratorResult(say=salvage, tool_calls=tool_calls_made, outcome_hint=outcome_hint)
+            # Empty response: one corrective retry with a strict reminder.
             messages.append({"role": "assistant", "content": raw[:500]})
             messages.append({"role": "user", "content": 'Respond with valid JSON only: {"tool": ...} or {"say": "..."}'})
             raw = await llm.chat(messages, temperature=0.2, max_tokens=VOICE_MAX_TOKENS)
             parsed = _extract_json(raw)
             if parsed is None:
+                salvage = _plain_text_say(raw)
+                if salvage:
+                    return OrchestratorResult(say=salvage, tool_calls=tool_calls_made, outcome_hint=outcome_hint)
                 raise ProviderError("The AI receptionist could not produce a valid response.")
 
         if "tool" in parsed:
