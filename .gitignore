@@ -58,3 +58,6 @@ tool-results/
 .env
 .env.local
 .env.*.local
+
+# preview test artifacts
+preview-*.png
