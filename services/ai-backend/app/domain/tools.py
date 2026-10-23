@@ -248,13 +248,98 @@ async def _compute_slots(
 
 # ── Tool implementations ──────────────────────────────────────────────────
 
+# ── Natural-language date normalization ──────────────────────────────────
+
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+# Tools whose "date" argument the LLM may express in natural language
+# ("tomorrow", "friday", "next monday", "in 3 days"). Normalized to
+# YYYY-MM-DD BEFORE Pydantic validation so a spoken relative date can never
+# burn tool-call iterations on a format error (voice UX rule: one shot).
+_DATE_ARG_TOOLS = {"get_provider_availability", "create_appointment", "reschedule_appointment"}
+
+_clinic_tz_cache: dict[str, tuple[str, float]] = {}
+
+
+async def _clinic_timezone(ctx: ToolContext) -> ZoneInfo:
+    """Clinic timezone with a 10-minute cache (timezones never change fast)."""
+    import time as _time
+
+    cached = _clinic_tz_cache.get(ctx.clinic_id)
+    if cached and _time.monotonic() - cached[1] < 600:
+        return ZoneInfo(cached[0])
+    clinic = await _clinic_row(ctx)
+    tz_name = clinic["timezone"] or "UTC"
+    _clinic_tz_cache[ctx.clinic_id] = (tz_name, _time.monotonic())
+    return ZoneInfo(tz_name)
+
+
+def _resolve_natural_date(text: str, today: datetime) -> str | None:
+    """Resolve a spoken date expression to YYYY-MM-DD; None when not natural."""
+    value = text.strip().lower().replace(".", "")
+    if not value or len(value) > 32:
+        return None
+
+    def fmt(d: datetime) -> str:
+        return d.strftime("%Y-%m-%d")
+
+    if value in ("today", "aaj"):
+        return fmt(today)
+    if value in ("tomorrow", "tomarrow", "kal"):
+        return fmt(today + timedelta(days=1))
+    if value in ("day after tomorrow", "parso"):
+        return fmt(today + timedelta(days=2))
+
+    if value.startswith("in ") and value.endswith("days"):
+        middle = value[3:-5].strip()
+        if middle.isdigit() and 0 <= int(middle) <= 60:
+            return fmt(today + timedelta(days=int(middle)))
+
+    # [next] <weekday> — the next occurrence (1-7 days ahead; "next" pushes
+    # past the immediate week when the weekday is today).
+    words = value.split()
+    has_next = words and words[0] in ("next", "coming", "upcoming")
+    target = words[-1] if words else ""
+    if target in _WEEKDAYS:
+        offset = (_WEEKDAYS[target] - today.weekday()) % 7
+        if offset == 0:
+            offset = 7
+        if has_next and offset < 7:
+            offset += 7 if offset <= 1 else 0
+        return fmt(today + timedelta(days=offset))
+    return None
+
+
+async def _normalize_date_args(tool_name: str, raw_args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    if tool_name not in _DATE_ARG_TOOLS:
+        return raw_args
+    raw_date = raw_args.get("date")
+    if not isinstance(raw_date, str):
+        return raw_args
+    raw_date = raw_date.strip()
+    if len(raw_date) == 10 and raw_date[4] == "-" and raw_date[7] == "-":
+        return raw_args  # already canonical
+    try:
+        tz = await _clinic_timezone(ctx)
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("UTC")
+    resolved = _resolve_natural_date(raw_date, datetime.now(tz))
+    if resolved:
+        raw_args["date"] = resolved
+    return raw_args
+
+
 async def execute_tool(name: str, raw_args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Dispatch a validated tool call. Raises AppError subclasses on failure."""
     model = TOOL_REGISTRY.get(name)
     if model is None:
         raise ValidationFailed(f"Unknown tool: {name}")
+    raw_args = await _normalize_date_args(name, dict(raw_args or {}), ctx)
     try:
-        args = model.model_validate(raw_args or {})
+        args = model.model_validate(raw_args)
     except Exception as exc:  # noqa: BLE001
         raise ValidationFailed(f"Invalid arguments for {name}: {exc}") from exc
 

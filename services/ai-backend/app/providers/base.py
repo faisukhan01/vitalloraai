@@ -31,7 +31,7 @@ TTS_TIMEOUT = 120.0  # multi-chunk synthesis with provider rate-limit backoff
 class LLMProvider(Protocol):
     name: str
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str: ...
+    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4, max_tokens: int | None = None) -> str: ...
 
 
 class STTProvider(Protocol):
@@ -44,6 +44,9 @@ class TTSProvider(Protocol):
     name: str
 
     async def synthesize(self, text: str, voice: str, speed: float = 1.0) -> tuple[str, str]: ...
+
+    async def is_cached(self, text: str, voice: str, speed: float = 1.0) -> bool:
+        """Best-effort cache probe; providers without a cache report False."""
 
 
 class ZAIBridgeProvider:
@@ -85,10 +88,10 @@ class ZAIBridgeProvider:
             raise ProviderError(f"AI provider error ({resp.status_code}). {detail}".strip())
         return resp.json()
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str:
+    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4, max_tokens: int | None = None) -> str:
         data = await self._post(
             "/llm/chat",
-            {"messages": messages, "temperature": temperature},
+            {"messages": messages, "temperature": temperature, **({"max_tokens": max_tokens} if max_tokens else {})},
             timeout=LLM_TIMEOUT,
         )
         content = str(data.get("content", "")).strip()
@@ -109,6 +112,14 @@ class ZAIBridgeProvider:
             raise ProviderError("Voice synthesis returned no audio.")
         return str(audio), str(fmt)
 
+    async def is_cached(self, text: str, voice: str, speed: float = 1.0) -> bool:
+        """Probe the bridge TTS LRU cache (~1ms); used for instant acks."""
+        try:
+            data = await self._post("/tts/check", {"text": text, "voice": voice, "speed": speed}, timeout=2.0)
+        except ProviderError:
+            return False
+        return bool(data.get("cached"))
+
 
 class OpenAIProvider:
     """Direct OpenAI API provider (requires OPENAI_API_KEY)."""
@@ -125,11 +136,16 @@ class OpenAIProvider:
         )
         self.tts_voice_map = {"tongtong": "alloy", "xiaochen": "echo", "jam": "onyx"}
 
-    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4) -> str:
+    async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4, max_tokens: int | None = None) -> str:
         try:
             resp = await self._client.post(
                 "/chat/completions",
-                json={"model": settings.openai_llm_model, "messages": messages, "temperature": temperature},
+                json={
+                    "model": settings.openai_llm_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    **({"max_tokens": max_tokens} if max_tokens else {}),
+                },
             )
         except httpx.HTTPError as exc:
             raise ProviderError("OpenAI API is unreachable.") from exc

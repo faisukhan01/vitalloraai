@@ -443,6 +443,10 @@ async function handleStt(req: Request, startedAt: number): Promise<Response> {
 // 2-16s per synthesis — replaying cached audio turns those into ~0ms.
 const TTS_CACHE_MAX_ENTRIES = 80;
 const ttsCache = new Map<string, { audio: Buffer; createdAt: number }>();
+// In-flight dedupe: concurrent requests for the same (voice, speed, text) —
+// e.g. the session-start warmer racing the first greet frame — share ONE
+// synthesis promise instead of doubling provider load (and 429 risk).
+const ttsInFlight = new Map<string, Promise<Buffer>>();
 
 function ttsCacheKey(text: string, voice: string, speed: number): string {
   return `${voice}|${speed}|${text}`;
@@ -455,6 +459,30 @@ function ttsCacheGet(key: string): Buffer | null {
   ttsCache.delete(key);
   ttsCache.set(key, hit);
   return hit.audio;
+}
+
+/**
+ * Synthesize-or-join: returns cached audio instantly, joins an identical
+ * in-flight synthesis, or starts one and registers it for others to join.
+ */
+function synthesizeDeduped(
+  key: string,
+  run: () => Promise<Buffer>,
+): Promise<Buffer> {
+  const cached = ttsCacheGet(key);
+  if (cached) return Promise.resolve(cached);
+  const existing = ttsInFlight.get(key);
+  if (existing) return existing;
+  const p = run()
+    .then((audio) => {
+      ttsCachePut(key, audio);
+      return audio;
+    })
+    .finally(() => {
+      ttsInFlight.delete(key);
+    });
+  ttsInFlight.set(key, p);
+  return p;
 }
 
 function ttsCachePut(key: string, audio: Buffer): void {
@@ -656,61 +684,90 @@ async function handleTts(req: Request, startedAt: number): Promise<Response> {
     return json(200, { audio_base64: cached.toString("base64"), format: "wav", duration_hint_ms: null });
   }
 
-  const chunks = splitTtsText(text);
-  if (chunks.length === 0) {
-    throw new ApiError(400, "invalid_request", "`text` contains no synthesizable content");
-  }
-
-  let audio: Buffer;
-  if (chunks.length === 1) {
-    const wav = await synthesizeChunk(zai, chunks[0] as string, voice, speed);
-    audio = Buffer.concat([buildWavHeader(wav.pcm.length, wav), wav.pcm]);
-  } else {
-    // Multi-chunk: parse each WAV, verify identical fmt params, merge PCM under
-    // one canonical header taken from the first chunk's parameters.
-    const parts = await mapPool(chunks, TTS_CHUNK_CONCURRENCY, (chunk) =>
-      synthesizeChunk(zai, chunk, voice, speed),
-    );
-    const first = parts[0] as WavInfo;
-    for (const part of parts.slice(1)) {
-      if (
-        part.audioFormat !== first.audioFormat ||
-        part.channels !== first.channels ||
-        part.sampleRate !== first.sampleRate ||
-        part.bitsPerSample !== first.bitsPerSample
-      ) {
-        throw new ApiError(
-          502,
-          "provider_error",
-          "TTS chunks returned inconsistent audio formats; refusing to concatenate",
-        );
-      }
+  // Dedupe across concurrent identical requests (warm-vs-greet race): whoever
+  // arrives first synthesizes; joiners await the same promise.
+  const audio = await synthesizeDeduped(cacheKey, async () => {
+    const chunks = splitTtsText(text);
+    if (chunks.length === 0) {
+      throw new ApiError(400, "invalid_request", "`text` contains no synthesizable content");
     }
-    const pcm = Buffer.concat(parts.map((p) => p.pcm));
-    audio = Buffer.concat([
-      buildWavHeader(pcm.length, {
-        audioFormat: first.audioFormat,
-        channels: first.channels,
-        sampleRate: first.sampleRate,
-        bitsPerSample: first.bitsPerSample,
-      }),
-      pcm,
-    ]);
-  }
+
+    let merged: Buffer;
+    if (chunks.length === 1) {
+      const wav = await synthesizeChunk(zai, chunks[0] as string, voice, speed);
+      merged = Buffer.concat([buildWavHeader(wav.pcm.length, wav), wav.pcm]);
+    } else {
+      // Multi-chunk: parse each WAV, verify identical fmt params, merge PCM under
+      // one canonical header taken from the first chunk's parameters.
+      const parts = await mapPool(chunks, TTS_CHUNK_CONCURRENCY, (chunk) =>
+        synthesizeChunk(zai, chunk, voice, speed),
+      );
+      const first = parts[0] as WavInfo;
+      for (const part of parts.slice(1)) {
+        if (
+          part.audioFormat !== first.audioFormat ||
+          part.channels !== first.channels ||
+          part.sampleRate !== first.sampleRate ||
+          part.bitsPerSample !== first.bitsPerSample
+        ) {
+          throw new ApiError(
+            502,
+            "provider_error",
+            "TTS chunks returned inconsistent audio formats; refusing to concatenate",
+          );
+        }
+      }
+      const pcm = Buffer.concat(parts.map((p) => p.pcm));
+      merged = Buffer.concat([
+        buildWavHeader(pcm.length, {
+          audioFormat: first.audioFormat,
+          channels: first.channels,
+          sampleRate: first.sampleRate,
+          bitsPerSample: first.bitsPerSample,
+        }),
+        pcm,
+      ]);
+    }
+    return merged;
+  });
 
   logRequest("info", "/tts", startedAt, 200, {
     chars: text.length,
     audio_bytes: audio.length,
-    chunks: chunks.length,
-    cache: "miss",
+    cache: "synthesized",
   });
-  ttsCachePut(cacheKey, audio);
   // duration_hint_ms stays null — we do not guess; caller can decode the WAV.
   return json(200, {
     audio_base64: audio.toString("base64"),
     format: "wav",
     duration_hint_ms: null,
   });
+}
+
+// ---------------------------------------------------------------------------
+// POST /tts/check — cache probe (no synthesis)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fast liveness probe for the TTS LRU cache. The backend uses it to decide
+ * whether an instant pre-warmed acknowledgment can be spoken with ~0ms
+ * latency: probe (~1ms) first, and only request audio when it is a hit.
+ * Never synthesizes — a miss returns {cached:false} immediately.
+ */
+async function handleTtsCheck(req: Request, startedAt: number): Promise<Response> {
+  const body = await readJsonBody(req);
+  const text = body.text;
+  if (typeof text !== "string" || text.trim().length === 0) {
+    throw new ApiError(400, "invalid_request", "`text` must be a non-empty string");
+  }
+  const voice = body.voice === undefined ? "tongtong" : body.voice;
+  if (typeof voice !== "string" || voice.length === 0) {
+    throw new ApiError(400, "invalid_request", "`voice` must be a non-empty string");
+  }
+  const speed = validateNumber(body, "speed", { min: 0.5, max: 2.0, required: false, fallback: 1.0 });
+  const cached = ttsCacheGet(ttsCacheKey(text, voice, speed)) !== null;
+  logRequest("info", "/tts/check", startedAt, 200, { chars: text.length, cache: cached ? "hit" : "miss" });
+  return json(200, { cached });
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +815,13 @@ async function route(req: Request): Promise<Response> {
         return apiError(405, "method_not_allowed", "Use POST /tts");
       }
       return await handleTts(req, startedAt);
+    }
+
+    if (url.pathname === "/tts/check") {
+      if (req.method !== "POST") {
+        return apiError(405, "method_not_allowed", "Use POST /tts/check");
+      }
+      return await handleTtsCheck(req, startedAt);
     }
 
     if (url.pathname === "/embeddings") {

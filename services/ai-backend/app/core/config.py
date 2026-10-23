@@ -68,8 +68,10 @@ class Settings(BaseSettings):
     @field_validator("turso_database_url")
     @classmethod
     def _validate_db_url(cls, v: str) -> str:
-        if v and not v.startswith("libsql://"):
-            raise ValueError("TURSO_DATABASE_URL must start with libsql://")
+        # libsql:// (cloud Turso) or http(s):// (local turso-mini emulator for
+        # offline development — see mini-services/turso-local).
+        if v and not (v.startswith("libsql://") or v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("TURSO_DATABASE_URL must start with libsql:// (cloud) or http(s):// (local dev)")
         return v
 
     @model_validator(mode="after")

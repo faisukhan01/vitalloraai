@@ -35,16 +35,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Input } from "@/components/ui/input";
 import { mapApiError } from "@/lib/utils-api";
 
-type Stage = "idle" | "connecting" | "listening" | "transcribing" | "thinking" | "speaking" | "ended" | "error";
+type Stage = "idle" | "connecting" | "listening" | "transcribing" | "thinking" | "thinking_ack" | "speaking" | "ended" | "error";
 
 interface Turn extends Pick<ConversationMessage, "role" | "content" | "tool_name"> {
   id: string;
 }
 
-const SILENCE_MS = 750; // phone-like turn taking: send ~0.75s after the caller stops
+const SILENCE_MS = 420; // snappy phone-like turn taking: send ~0.4s after the caller stops
 const MAX_UTTERANCE_MS = 15000;
-const MIN_UTTERANCE_MS = 450; // discard noise blips
-const CALIBRATION_FRAMES = 30; // ~0.5 s of ambient-noise sampling at 60 fps
+const MIN_UTTERANCE_MS = 250; // accept short utterances ("yes") quickly, still discard blips
+const CALIBRATION_FRAMES = 12; // ~0.2 s ambient-noise sampling — barely delays first capture
 const LOW_MIC_HINT_MS = 6000;
 
 interface WavPacket {
@@ -164,6 +164,9 @@ export function VoiceLabClient() {
   const stageRef = useRef<Stage>("idle");
   const mutedRef = useRef(false);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // App-level WS keepalive: intermediary proxies may drop idle connections;
+  // a tiny ping frame every 20s keeps the path alive end to end.
+  const keepaliveRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingRef = useRef(false);
   const recStartRef = useRef(0);
   const barFrame = useRef(0);
@@ -413,6 +416,10 @@ export function VoiceLabClient() {
       wsRef.current = null;
       teardownMic();
       stopAudio();
+      if (keepaliveRef.current) {
+        clearInterval(keepaliveRef.current);
+        keepaliveRef.current = null;
+      }
       const sid = sessionRef.current;
       sessionRef.current = null;
       setSessionId(null);
@@ -505,6 +512,17 @@ export function VoiceLabClient() {
             break;
           case "audio": {
             if (msg.data) {
+              // Echo guard: if a recording is already in flight when assistant
+              // audio arrives (caller began speaking during the think/ack gap),
+              // discard it — it is contaminated with the assistant's own voice.
+              if (recordingRef.current) {
+                if (silenceTimerRef.current) {
+                  clearTimeout(silenceTimerRef.current);
+                  silenceTimerRef.current = null;
+                }
+                chunksRef.current = [];
+                stopRecording();
+              }
               const binary = atob(msg.data);
               const bytes = new Uint8Array(binary.length);
               for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -517,6 +535,8 @@ export function VoiceLabClient() {
             }
             break;
           }
+          case "pong":
+            break;
           case "error":
             setErrorMsg(msg.message ?? "An error occurred during the call.");
             break;
@@ -537,6 +557,12 @@ export function VoiceLabClient() {
         ws.onopen = () => resolve();
         ws.onerror = () => reject(new Error("WebSocket failed to connect"));
       });
+
+      // Keepalive: the server answers {"type":"pong"} and ignores the frame.
+      if (keepaliveRef.current) clearInterval(keepaliveRef.current);
+      keepaliveRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+      }, 20_000);
 
       // Greet immediately — it must not depend on microphone availability.
       // Mic setup is asynchronous: if the browser blocks or denies access,
@@ -565,7 +591,7 @@ export function VoiceLabClient() {
 
   // Waveform bars animate from the live microphone RMS (genuinely audio-driven).
   useEffect(() => {
-    if (!["listening", "transcribing", "thinking", "speaking"].includes(stage)) {
+    if (!["listening", "transcribing", "thinking", "thinking_ack", "speaking"].includes(stage)) {
       setBars(Array.from({ length: 36 }, () => 3));
       return;
     }
@@ -593,12 +619,13 @@ export function VoiceLabClient() {
     listening: "Listening — speak naturally",
     transcribing: "Transcribing your speech…",
     thinking: "Receptionist is thinking…",
+    thinking_ack: "Receptionist is checking…",
     speaking: "Receptionist is speaking — interrupt anytime",
     ended: "Call ended",
     error: "Error",
   };
 
-  const isActive = ["connecting", "listening", "transcribing", "thinking", "speaking"].includes(stage);
+  const isActive = ["connecting", "listening", "transcribing", "thinking", "thinking_ack", "speaking"].includes(stage);
   const levelPct = Math.min(100, Math.round(level * 400));
 
   return (

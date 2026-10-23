@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 4
 MAX_HISTORY_MESSAGES = 12
+# Voice latency: replies are spoken (2-3 short sentences), so a generous-but-
+# bounded token budget cuts generation time measurably and prevents rambling.
+VOICE_MAX_TOKENS = 280
 
 LANGUAGE_NAMES = {"en": "English", "ur": "Urdu (اردو)", "hi": "Hindi (हिन्दी)", "ar": "Arabic (العربية)"}
 
@@ -275,13 +278,13 @@ async def run_turn(
     outcome_hint: str | None = None
 
     for _ in range(MAX_TOOL_ITERATIONS + 1):
-        raw = await llm.chat(messages, temperature=0.4)
+        raw = await llm.chat(messages, temperature=0.4, max_tokens=VOICE_MAX_TOKENS)
         parsed = _extract_json(raw)
         if parsed is None:
             # Model broke protocol: one corrective retry with a strict reminder.
             messages.append({"role": "assistant", "content": raw[:500]})
             messages.append({"role": "user", "content": 'Respond with valid JSON only: {"tool": ...} or {"say": "..."}'})
-            raw = await llm.chat(messages, temperature=0.2)
+            raw = await llm.chat(messages, temperature=0.2, max_tokens=VOICE_MAX_TOKENS)
             parsed = _extract_json(raw)
             if parsed is None:
                 raise ProviderError("The AI receptionist could not produce a valid response.")

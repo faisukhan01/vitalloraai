@@ -109,19 +109,26 @@ async def start_voice_session(
         started_at=now,
         caller_ref=caller_ref,
     )
-    # Warm the TTS cache for this receptionist's greeting while the caller is
-    # still looking at the "connecting" screen — the WS "greet" frame that
-    # arrives seconds later then hits the cache and speaks instantly.
+    # Warm the TTS cache while the caller is still looking at the "connecting"
+    # screen: the greeting (so the WS "greet" frame speaks instantly) followed
+    # by the instant-ack lines and the retry phrase, so every fast path of the
+    # conversation becomes a ~0ms cache hit within a few seconds.
     greeting_text = (receptionist.get("greeting_message") or "").strip()
-    if greeting_text:
-        voice = receptionist["voice_id"]
-        speed = float(receptionist["speaking_speed"] or 1.0)
+    voice = receptionist["voice_id"]
+    speed = float(receptionist["speaking_speed"] or 1.0)
 
-        async def _warm() -> None:
+    async def _warm() -> None:
+        if greeting_text:
             with suppress(ProviderError, Exception):
                 await get_tts().synthesize(greeting_text, voice=voice, speed=speed)
+        # Provider rate-limits concurrent/bursty synthesis (429): space the
+        # warm calls out so warming never steals budget from live turns.
+        for line in (*_ACK_LINES, _RETRY_SAY):
+            with suppress(ProviderError, Exception):
+                await get_tts().synthesize(line, voice=voice, speed=speed)
+            await asyncio.sleep(1.0)
 
-        _bg(_warm())
+    _bg(_warm())
     return VoiceSessionStartResponse(session=session, greeting_text=greeting_text)
 
 
@@ -191,6 +198,20 @@ async def end_voice_session(
 ws_logger = logging.getLogger("vitalora.voice")
 
 _RETRY_SAY = "I am sorry, I did not catch that. Could you say it again?"
+
+# ── Instant acknowledgment backchannel ───────────────────────────────────────
+# A real receptionist acknowledges instantly ("Mm-hmm", "One moment") before
+# looking up the answer. We pre-synthesize short ack lines in the session's
+# voice at session start; after each recognized utterance the WS loop probes
+# the bridge TTS cache (~1ms) and, on a hit, speaks the ack IMMEDIATELY while
+# STT→LLM→TTS for the real answer is still running. Perceived response time
+# drops from ~3-4s to well under a second. Rotation keeps it human.
+_ACK_LINES = (
+    "Mm-hmm.",
+    "One moment, please.",
+    "Sure, let me check that for you.",
+)
+_ack_counter = 0
 
 
 async def _load_turn_context(session_id: str, org_id: str) -> tuple[dict, dict, dict, ToolContext, dict, str]:
@@ -289,6 +310,36 @@ async def _speak_and_send(ws: WebSocket, text: str, voice: str, speed: float) ->
     await ws.send_json({"type": "audio", "format": fmt, "data": audio_b64})
     _bg(_record_usage(ws.state.org_id, ws.state.session_id, "tts_chars", ws.state.tts_provider, len(text)))
     log_extra(ws_logger, logging.INFO, "tts delivered", chars=len(text), ms=int((_time.perf_counter() - t0) * 1000))
+
+
+async def _speak_instant_ack(ws: WebSocket, voice: str, speed: float) -> None:
+    """Speak a short pre-warmed acknowledgment with ~0ms latency.
+
+    A natural backchannel ('Mm-hmm.', 'One moment, please.') is sent while the
+    real answer is still being generated, so the caller perceives an immediate
+    response. Only fires when the audio is genuinely a cache hit (probed via
+    /tts/check, ~1ms) — otherwise it is skipped silently rather than adding a
+    2s synthesis delay to the hot path.
+    """
+    global _ack_counter
+    _ack_counter += 1
+    candidates = (_ACK_LINES[_ack_counter % len(_ACK_LINES)], *_ACK_LINES)
+    tts = get_tts()
+    for line in candidates:
+        try:
+            if not await tts.is_cached(line, voice=voice, speed=speed):
+                continue
+        except Exception:  # noqa: BLE001 — probe must never break the turn
+            return
+        try:
+            audio_b64, fmt = await tts.synthesize(line, voice=voice, speed=speed)  # cache hit ≈ 0ms
+        except ProviderError:
+            return
+        with suppress(Exception):
+            await ws.send_json({"type": "status", "stage": "thinking_ack"})
+            await ws.send_json({"type": "audio", "format": fmt, "data": audio_b64, "ack": True})
+        log_extra(ws_logger, logging.INFO, "instant ack sent", chars=len(line))
+        return
 
 
 _SENTENCE_END_RE = re.compile(r"[.!?。！？](?=\s|$)")
@@ -417,6 +468,10 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
             if msg_type == "end":
                 await websocket.send_json({"type": "ended"})
                 break
+            if msg_type == "ping":
+                # Client keepalive — reply immediately, never treat as a turn.
+                await websocket.send_json({"type": "pong"})
+                continue
 
             if msg_type == "greet":
                 # Speak the configured greeting (persisted as the first assistant turn).
@@ -480,6 +535,12 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
             # query inside run_turn deliberately covers only PREVIOUS turns —
             # the current utterance is appended to the prompt explicitly).
             _bg(_persist_message(session_id, principal.organization_id, "user", user_text))
+
+            # ── 1.5) Instant acknowledgment (voice turns only) ───────────
+            # Speaks a pre-warmed 'Mm-hmm'/'One moment' NOW while the LLM and
+            # the answer's TTS are still ahead of us. Skipped for typed input.
+            if user_text is not None and audio_b64 is not None:
+                await _speak_instant_ack(websocket, voice_id, speed)
 
             # ── 2) Orchestration (safety + RAG + tools) ──────────────────
             await websocket.send_json({"type": "status", "stage": "thinking"})
