@@ -11,6 +11,12 @@ const nextConfig: NextConfig = {
   output: "standalone",
   reactStrictMode: true,
   transpilePackages: ["@vitalora/shared-types", "@vitalora/api-client"],
+  // Sandbox preview panels (preview-chat-*.space-z.ai) serve the app through a
+  // proxy whose forwarded host differs from the dev server's own origin.
+  // Without this, Next.js dev treats every /_next/* asset request as
+  // cross-origin and its dev protection turns the proxied navigation into a
+  // redirect loop (ERR_TOO_MANY_REDIRECTS) for the user.
+  allowedDevOrigins: ["*.space-z.ai"],
   async rewrites() {
     if (!API_PROXY_URL) return [];
     return [
