@@ -1058,6 +1058,9 @@ export function VoiceLabClient() {
     };
 
     rec.onerror = (event) => {
+      // Intentional stops/replacements (pause during playback, teardown) abort
+      // the recognizer and would otherwise count as failures — ignore them.
+      if (recogRef.current !== rec) return;
       const kind = event.error;
       if (kind === "not-allowed" || kind === "service-not-allowed" || kind === "audio-capture") {
         // Browser recognition is unavailable (permission/iframe policy) —
@@ -1065,8 +1068,21 @@ export function VoiceLabClient() {
         browserSttRef.current = false;
         setBrowserSttActive(false);
         stopBrowserRecognition();
+        return;
       }
-      // "no-speech" / "network" / "aborted" → onend decides whether to restart.
+      if (kind === "network") {
+        // Chrome's recognizer talks to Google servers; restricted networks
+        // make it fail in an endless restart loop that LOOKS like "the AI
+        // isn't listening". After 3 consecutive network failures, hand the
+        // job to the server audio path (backend STT) instead of looping.
+        recogFailuresRef.current += 1;
+        if (recogFailuresRef.current >= 3) {
+          browserSttRef.current = false;
+          setBrowserSttActive(false);
+          stopBrowserRecognition();
+        }
+      }
+      // "no-speech" / "aborted" → onend decides whether to restart.
     };
 
     rec.onend = () => {

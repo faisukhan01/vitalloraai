@@ -25,6 +25,14 @@ import ZAI from "z-ai-web-dev-sdk";
 
 const PORT: number = Number.parseInt(process.env.AI_BRIDGE_PORT ?? "", 10) || 8100;
 
+// Version fingerprint: the backend supervisor stamps the sha256 of this file
+// into BRIDGE_FINGERPRINT when it spawns us and compares it against /health.
+// This makes "adopt a bridge that is actually running STALE code" impossible:
+// an old zombie process on :8100 (e.g. serving the previous model or retry
+// logic) is detected and replaced instead of silently serving old behaviour.
+const BRIDGE_FINGERPRINT: string = process.env.BRIDGE_FINGERPRINT ?? "unstampeded";
+const BRIDGE_PID: number = process.pid;
+
 // The "brain" of the AI. glm-4-plus (the SDK default) is hard rate-limited on
 // this gateway (measured: 429 on nearly every burst), while glm-4.6 — the
 // newest flagship — answers in ~0.4s and is dramatically better at natural
@@ -64,12 +72,17 @@ const RETRYABLE_PROVIDER_STATUS_RE = /API request failed with status (?:429|500|
 // Retry backoff with randomized jitter: consecutive voice-pipeline calls that
 // burst together would otherwise retry in lockstep and re-trigger the same
 // provider 429 window. Jitter spreads the retries across ~1-2s and ~2-4s.
-const PROVIDER_RETRY_DELAYS_MS = [800, 2_000, 4_500, 8_000] as const;
-// Server-side STT is now only a FALLBACK (the browser's native recognizer is
-// primary), so it can afford a patient backoff that outlives the provider's
-// 429 window instead of failing the caller mid-conversation.
+//
+// LLM/STT quotas on this gateway are throttled in WINDOWS that measured up to
+// ~90s (gateway-wide, all models 429 instantly, TTS quota unaffected). The old
+// ~16s chain exhausted mid-window and failed the caller's turn with a busy
+// apology. 40s of patient backoff rides out typical windows; the voice call
+// covers the wait with the cached instant-ack ("One moment") and the caller
+// can also read the typed reply. STT keeps a slightly shorter chain because
+// the browser-native recognizer is the primary path anyway.
+const PROVIDER_RETRY_DELAYS_MS = [1_000, 3_000, 6_000, 12_000, 18_000] as const;
 const STT_RETRY_DELAYS_MS = [1_000, 2_500, 5_000, 8_000] as const;
-const PROVIDER_RETRY_JITTER_MS = 400;
+const PROVIDER_RETRY_JITTER_MS = 600;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1017,6 +1030,9 @@ async function route(req: Request): Promise<Response> {
         status: "ok",
         service: "ai-bridge",
         providers: { llm: "zai", stt: "zai", tts: "zai" },
+        llm_model: LLM_MODEL,
+        fingerprint: BRIDGE_FINGERPRINT,
+        pid: BRIDGE_PID,
       });
     }
 

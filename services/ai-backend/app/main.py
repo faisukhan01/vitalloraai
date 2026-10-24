@@ -30,6 +30,20 @@ logger = logging.getLogger("vitalora")
 async def lifespan(app: FastAPI):
     configure_logging()
     log_extra(logger, logging.INFO, "backend starting", db=settings.turso_database_url.split("//")[1].split("/")[0])
+
+    # Own the LOCAL database server lifecycle FIRST (sandbox reapers kill it;
+    # without it every endpoint 500s). No-op against the Turso cloud.
+    from app.core import db_supervisor
+
+    try:
+        if await db_supervisor.ensure_db_server():
+            log_extra(logger, logging.INFO, "db server ready", url=settings.turso_database_url)
+        else:
+            log_extra(logger, logging.ERROR, "db server UNAVAILABLE — API will 500 until it is up")
+    except Exception:  # noqa: BLE001 — never block boot on infrastructure healing
+        logger.exception("db server startup probe failed")
+    db_supervisor.start_watchdog()
+
     # Warm the entire DB pool before serving: cold Hrana sessions queue
     # server-side, so the first caller after a process start would otherwise
     # wait seconds on their first turn.
