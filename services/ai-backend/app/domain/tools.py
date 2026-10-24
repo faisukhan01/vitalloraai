@@ -26,6 +26,46 @@ from app.db.client import db
 
 logger = logging.getLogger(__name__)
 
+
+async def _bridge_web_search(query: str) -> dict[str, Any]:
+    """Live web search via the ai-bridge sidecar (z-ai web_search function).
+
+    Gives the receptionist genuine, current general knowledge — the caller can
+    ask anything a general assistant could answer. Results are trimmed to
+    speakable essentials so the TOOL_RESULT stays small and fast.
+    """
+    import httpx
+
+    from app.core.config import settings
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{settings.ai_bridge_url}/websearch",
+                json={"query": query, "num": 4},
+            )
+        if resp.status_code != 200:
+            return {"error": True, "message": "Web search is unavailable right now."}
+        items = resp.json().get("results", []) or []
+    except Exception:  # noqa: BLE001 — search must never crash a turn
+        logger.exception("web_search tool failed")
+        return {"error": True, "message": "Web search is unavailable right now."}
+
+    results = [
+        {
+            "title": (it.get("name") or "")[:120],
+            "summary": (it.get("snippet") or "")[:320],
+            "source": it.get("host_name") or "",
+            "date": it.get("date") or "",
+        }
+        for it in items
+        if isinstance(it, dict)
+    ]
+    if not results:
+        return {"results": [], "note": "No useful results found. Say honestly that you could not find it."}
+    return {"results": results, "note": "Answer from these results in your own words. Keep it short and spoken."}
+
+
 # ── Argument models ───────────────────────────────────────────────────────
 
 class GetClinicInformationArgs(BaseModel):
@@ -83,6 +123,10 @@ class CreateStaffCallbackRequestArgs(BaseModel):
     priority: Literal["low", "normal", "high", "urgent"] = "normal"
 
 
+class WebSearchArgs(BaseModel):
+    query: str = Field(min_length=2, max_length=300)
+
+
 TOOL_REGISTRY: dict[str, type[BaseModel]] = {
     "get_clinic_information": GetClinicInformationArgs,
     "get_services": GetServicesArgs,
@@ -93,6 +137,7 @@ TOOL_REGISTRY: dict[str, type[BaseModel]] = {
     "cancel_appointment": CancelAppointmentArgs,
     "transfer_to_human": TransferToHumanArgs,
     "create_staff_callback_request": CreateStaffCallbackRequestArgs,
+    "web_search": WebSearchArgs,
 }
 
 TOOL_DESCRIPTIONS = """Available tools (call at most one per response):
@@ -105,6 +150,7 @@ TOOL_DESCRIPTIONS = """Available tools (call at most one per response):
 - cancel_appointment {"appointment_id": string, "reason": string}: cancel an existing appointment.
 - transfer_to_human {"reason": string}: escalate to clinic staff when you cannot help or the caller asks for a person.
 - create_staff_callback_request {"patient_name": string, "patient_phone": string, "reason"?: string, "priority"?: "low"|"normal"|"high"|"urgent"}: request a staff callback.
+- web_search {"query": string}: search the live web. Use for general or current questions you are not certain about (news, weather, public facts, prices outside the clinic, "latest" anything). NOT for clinic-internal facts — those come from get_clinic_information/get_services or the approved knowledge. After the search, answer from the results.
 """
 
 
@@ -532,5 +578,8 @@ async def execute_tool(name: str, raw_args: dict[str, Any], ctx: ToolContext) ->
             "callback_id": cb_id,
             "instruction": "Confirm to the caller that staff will call them back and thank them.",
         }
+
+    if name == "web_search":
+        return await _bridge_web_search(args.query)
 
     raise ValidationFailed(f"Tool '{name}' is not implemented.")

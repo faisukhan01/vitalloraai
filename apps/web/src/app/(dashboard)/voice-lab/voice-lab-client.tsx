@@ -4,17 +4,21 @@
  * LIVE AI VOICE LABORATORY (spec §6E)
  *
  * A genuine two-way voice conversation with the configured AI receptionist:
- * - Browser microphone capture (MediaRecorder) with adaptive voice-activity
- *   detection: the ambient noise floor is calibrated on every call and the
- *   speech threshold adjusts to the room and the mic level.
- * - Utterances are decoded, resampled to 16 kHz mono WAV and peak-normalized
- *   before upload, so the recognizer always receives clean, well-levelled
- *   audio regardless of the recording container the browser produced.
+ * - Browser microphone capture with adaptive voice-activity detection: the
+ *   ambient noise floor is calibrated on every call and the speech threshold
+ *   adjusts to the room and the mic level.
+ * - Continuous PCM capture with a 700ms PRE-ROLL buffer: the ~700ms before
+ *   speech onset is prepended to every utterance, so the recognizer receives
+ *   the COMPLETE utterance (MediaRecorder-based capture clipped the first
+ *   word, which misheard whole sentences). Utterances are resampled to
+ *   16 kHz mono, peak-normalized and silence-trimmed before upload — no
+ *   leading silence means no recognizer hallucinations ("#").
  * - Echo-proof turn taking: the microphone is never armed while the assistant's
  *   audio is still playing (recording resumes the moment playback ends or the
  *   caller barges in), so the recognizer never transcribes the assistant's
  *   own voice.
- * - Turn-based WebSocket pipeline: mic → STT → LLM (+tools, +RAG, +safety) → TTS.
+ * - Turn-based WebSocket pipeline: mic → STT → LLM (+tools, +web search,
+ *   +RAG, +safety) → TTS.
  * - Keyboard text fallback for environments without microphone access.
  *
  * Every message below is produced by the real pipeline. If credentials or the
@@ -52,6 +56,12 @@ const MAX_UTTERANCE_MS = 15000;
 const MIN_UTTERANCE_MS = 320; // accept short utterances ("yes") quickly, still discard blips
 const CALIBRATION_FRAMES = 12; // ~0.2 s ambient-noise sampling — barely delays first capture
 const LOW_MIC_HINT_MS = 4500;
+// Pre-roll: raw mic PCM is tapped CONTINUOUSLY and the ~700ms before speech
+// onset is prepended to every utterance. MediaRecorder could only start AFTER
+// the VAD fired (+recorder start latency), clipping the attack of the first
+// word — the main source of misheard transcripts ("What kind of AI are you?"
+// → "Can't AI you are?").
+const PRE_ROLL_MS = 700;
 
 interface WavPacket {
   b64: string;
@@ -225,6 +235,60 @@ async function blobToRawBase64(blob: Blob): Promise<string> {
   return btoa(binary);
 }
 
+/** Linear-interpolation resample to 16 kHz — the recognizer's native rate. */
+function resampleTo16k(input: Float32Array, fromRate: number): Float32Array {
+  if (fromRate === 16000 || input.length === 0) return input;
+  const ratio = fromRate / 16000;
+  const outLen = Math.max(1, Math.floor(input.length / ratio));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const frac = pos - i0;
+    const a = input[i0] ?? 0;
+    const b = i0 + 1 < input.length ? input[i0 + 1] : a;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+/** Peak-normalize to 0.92 (max gain 8x), clamped — same levelling as before. */
+function normalizeAudio(samples: Float32Array): Float32Array {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const a = samples[i] < 0 ? -samples[i] : samples[i];
+    if (a > peak) peak = a;
+  }
+  const gain = peak > 0.001 ? Math.min(0.92 / peak, 8) : 1;
+  const out = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i] * gain;
+    out[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+  }
+  return out;
+}
+
+/**
+ * Trim leading/trailing near-silence (post-normalization), keeping padMs of
+ * breathing room. Leading silence is the #1 trigger for recognizer
+ * hallucinations (measured live: silence in → '#' transcript out), and
+ * trailing silence wastes upload time. Pure silence yields a zero-length
+ * array so the sender can discard it without an upload at all.
+ */
+function trimAudio(samples: Float32Array, rate: number, threshold = 0.02, padMs = 150): Float32Array {
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < samples.length; i++) {
+    if (samples[i] > threshold || samples[i] < -threshold) {
+      if (first < 0) first = i;
+      last = i;
+    }
+  }
+  if (first < 0) return new Float32Array(0);
+  const pad = Math.floor((rate * padMs) / 1000);
+  return samples.slice(Math.max(0, first - pad), Math.min(samples.length, last + pad));
+}
+
 export function VoiceLabClient() {
   const params = useSearchParams();
   const presetReceptionistId = params.get("receptionist") ?? "";
@@ -282,6 +346,16 @@ export function VoiceLabClient() {
   // microphone is mid-utterance: playback starts the moment the utterance is
   // flushed, so the assistant never talks over (or discards) live speech.
   const holdForMicRef = useRef(false);
+  // ── PCM pre-roll capture pipeline ────────────────────────────────────────
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const micSinkRef = useRef<GainNode | null>(null);
+  const pcmActiveRef = useRef(false); // PCM pipeline owns onset/endpointing
+  const preRollRef = useRef<Float32Array[]>([]);
+  const preRollFramesRef = useRef(0);
+  const utteranceRef = useRef<Float32Array[]>([]);
+  const utteranceFramesRef = useRef(0);
+  const utteranceSilenceMsRef = useRef(0);
 
   stageRef.current = stage;
   mutedRef.current = muted;
@@ -461,6 +535,43 @@ export function VoiceLabClient() {
     }
   }, [pumpQueue]);
 
+  /** Send a captured utterance: resample → normalize → trim silence → WAV. */
+  const sendPcmUtterance = useCallback(
+    (chunks: Float32Array[], frameCount: number, rate: number) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN || frameCount <= 0) {
+        releaseHeldAudio();
+        return;
+      }
+      const merged = new Float32Array(frameCount);
+      let off = 0;
+      for (const c of chunks) {
+        if (off + c.length <= frameCount) {
+          merged.set(c, off);
+          off += c.length;
+        }
+      }
+      const normalized = normalizeAudio(resampleTo16k(merged, rate));
+      const trimmed = trimAudio(normalized, 16000);
+      // Speech-duration check on the TRIMMED audio: blips and pure noise are
+      // discarded locally and never reach the recognizer.
+      if ((trimmed.length / 16000) * 1000 < MIN_UTTERANCE_MS) {
+        releaseHeldAudio();
+        return;
+      }
+      const wav = encodeWav16(trimmed, 16000);
+      let binary = "";
+      const bytes = new Uint8Array(wav);
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      }
+      ws.send(JSON.stringify({ type: "audio", data: btoa(binary) }));
+      releaseHeldAudio();
+    },
+    [releaseHeldAudio],
+  );
+
   const sendUtterance = useCallback(
     async (blob: Blob, mimeType: string) => {
       const ws = wsRef.current;
@@ -492,10 +603,15 @@ export function VoiceLabClient() {
   );
 
   const stopRecording = useCallback(() => {
-    if (recorderRef.current && recorderRef.current.state === "recording") {
-      recorderRef.current.stop();
-    }
+    // PCM pipeline: drop any in-flight utterance (mute / end call / barge-in
+    // discard). The chunks are garbage-collected; nothing is ever sent.
+    utteranceRef.current = [];
+    utteranceFramesRef.current = 0;
+    utteranceSilenceMsRef.current = 0;
     recordingRef.current = false;
+    if (recorderRef.current && recorderRef.current.state === "recording") {
+      recorderRef.current.stop(); // fallback MediaRecorder path
+    }
   }, []);
 
   const startRecording = useCallback(() => {
@@ -569,7 +685,23 @@ export function VoiceLabClient() {
           speechFrames = 0;
         }
       } else if (micArmed && !mutedRef.current) {
-        if (rms > threshold) {
+        if (pcmActiveRef.current) {
+          // The PCM pipeline (onaudioprocess) owns speech onset and
+          // endpointing — it sees raw samples and keeps a 700ms pre-roll.
+          // The RAF loop only keeps the low-mic hint alive here.
+          if (rms > threshold) {
+            quietMsRef.current = 0;
+          } else {
+            quietMsRef.current += dt;
+            if (quietMsRef.current > LOW_MIC_HINT_MS && !recordingRef.current) {
+              setMicHint(
+                "We can barely hear you — speak a little louder and closer to the mic, or type your question in the box below.",
+              );
+              quietMsRef.current = 0;
+            }
+          }
+        } else if (rms > threshold) {
+          // Legacy MediaRecorder fallback path (no ScriptProcessorNode).
           quietMsRef.current = 0;
           if (!recordingRef.current) startRecording();
           if (silenceTimerRef.current) {
@@ -627,26 +759,122 @@ export function VoiceLabClient() {
       source.connect(analyser);
       analyserRef.current = analyser;
 
-      // Pick the first container this browser can actually record (Safari
-      // only does mp4, Firefox prefers ogg/webm, Chrome webm/opus).
-      const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
-      const mime = candidates.find(
-        (m) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m),
-      );
-      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-      recorder.onstop = () => {
-        if (chunksRef.current.length > 0) {
-          const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
-          chunksRef.current = [];
-          if (Date.now() - recStartRef.current >= MIN_UTTERANCE_MS) {
-            void sendUtterance(blob, recorder.mimeType || "audio/webm");
+      // ── Preferred capture: continuous PCM tap with pre-roll ──────────────
+      // The raw (echo-cancelled, noise-suppressed) stream is tapped on every
+      // render quantum. Speech onset prepends the last PRE_ROLL_MS of audio
+      // to the utterance, endpointing applies the SILENCE_MS window, and the
+      // finished utterance is resampled to 16 kHz, normalized and
+      // silence-trimmed before upload. The recognizer therefore receives the
+      // COMPLETE utterance — first word intact, zero leading silence.
+      if (typeof ctx.createScriptProcessor === "function") {
+        const sampleRate = ctx.sampleRate;
+        const node = ctx.createScriptProcessor(4096, 1, 1);
+        const sink = ctx.createGain();
+        sink.gain.value = 0; // keep the node pumping without audible feedback
+        node.onaudioprocess = (e: AudioProcessingEvent) => {
+          const input = e.inputBuffer.getChannelData(0);
+          if (!input || input.length === 0) return;
+          const chunk = input.slice(); // copy — the buffer is reused
+          const chunkMs = (chunk.length / sampleRate) * 1000;
+          let sum = 0;
+          for (let i = 0; i < chunk.length; i++) {
+            const v = chunk[i];
+            sum += v * v;
           }
-        }
-      };
-      recorderRef.current = recorder;
+          const rms = Math.sqrt(sum / chunk.length);
+
+          if (recordingRef.current) {
+            // ── Live utterance: append speech, watch the silence window ──
+            if (rms > thresholdRef.current && !mutedRef.current) {
+              utteranceRef.current.push(chunk);
+              utteranceFramesRef.current += chunk.length;
+              utteranceSilenceMsRef.current = 0;
+            } else {
+              utteranceSilenceMsRef.current += chunkMs;
+              if (utteranceSilenceMsRef.current <= 240) {
+                // Keep a little natural trailing room.
+                utteranceRef.current.push(chunk);
+                utteranceFramesRef.current += chunk.length;
+              }
+            }
+            const elapsedMs = (utteranceFramesRef.current / sampleRate) * 1000;
+            const finished = utteranceSilenceMsRef.current >= SILENCE_MS || elapsedMs >= MAX_UTTERANCE_MS;
+            if (finished) {
+              const chunks = utteranceRef.current;
+              const frames = utteranceFramesRef.current;
+              utteranceRef.current = [];
+              utteranceFramesRef.current = 0;
+              utteranceSilenceMsRef.current = 0;
+              recordingRef.current = false;
+              if (frames > 0) sendPcmUtterance(chunks, frames, sampleRate);
+            }
+            return;
+          }
+
+          // ── Idle: maintain the pre-roll, arm on speech onset ────────────
+          const st = stageRef.current;
+          const armed =
+            st === "listening" || st === "transcribing" || st === "thinking" || st === "thinking_ack";
+          if (!armed || mutedRef.current || speakingRef.current || audioPlayingRef.current) {
+            if (preRollFramesRef.current > 0) {
+              preRollRef.current = [];
+              preRollFramesRef.current = 0;
+            }
+            return;
+          }
+          preRollRef.current.push(chunk);
+          preRollFramesRef.current += chunk.length;
+          const maxFrames = Math.ceil((sampleRate * PRE_ROLL_MS) / 1000);
+          while (
+            preRollRef.current.length > 0 &&
+            preRollFramesRef.current - (preRollRef.current[0]?.length ?? 0) >= maxFrames
+          ) {
+            const dropped = preRollRef.current.shift();
+            if (dropped) preRollFramesRef.current -= dropped.length;
+          }
+          if (rms > thresholdRef.current) {
+            // Speech onset: pre-roll + this chunk become the utterance, so
+            // even the very first phoneme reaches the recognizer.
+            const chunks = [...preRollRef.current, chunk];
+            const frames = preRollFramesRef.current + chunk.length;
+            preRollRef.current = [];
+            preRollFramesRef.current = 0;
+            utteranceRef.current = chunks;
+            utteranceFramesRef.current = frames;
+            utteranceSilenceMsRef.current = 0;
+            recordingRef.current = true;
+            recStartRef.current = Date.now();
+          }
+        };
+        source.connect(node);
+        node.connect(sink);
+        sink.connect(ctx.destination);
+        micSourceRef.current = source;
+        micNodeRef.current = node;
+        micSinkRef.current = sink;
+        pcmActiveRef.current = true;
+      } else {
+        // ── Legacy fallback: MediaRecorder (no PCM tap available) ───────────
+        pcmActiveRef.current = false;
+        const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+        const mime = candidates.find(
+          (m) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m),
+        );
+        const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) chunksRef.current.push(e.data);
+        };
+        recorder.onstop = () => {
+          if (chunksRef.current.length > 0) {
+            const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
+            chunksRef.current = [];
+            if (Date.now() - recStartRef.current >= MIN_UTTERANCE_MS) {
+              void sendUtterance(blob, recorder.mimeType || "audio/webm");
+            }
+          }
+        };
+        recorderRef.current = recorder;
+      }
       resetVadCalibration();
       monitorLoop();
       return true;
@@ -656,11 +884,27 @@ export function VoiceLabClient() {
       );
       return false;
     }
-  }, [monitorLoop, resetVadCalibration, sendUtterance]);
+  }, [monitorLoop, resetVadCalibration, sendPcmUtterance, sendUtterance]);
 
   const teardownMic = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
     stopRecording();
+    // Detach the PCM tap (mic source → processor → zero-gain sink).
+    try {
+      micNodeRef.current?.disconnect();
+      micSinkRef.current?.disconnect();
+      micSourceRef.current?.disconnect();
+    } catch {
+      /* nodes may already be disconnected */
+    }
+    micNodeRef.current = null;
+    micSinkRef.current = null;
+    micSourceRef.current = null;
+    pcmActiveRef.current = false;
+    preRollRef.current = [];
+    preRollFramesRef.current = 0;
+    utteranceRef.current = [];
+    utteranceFramesRef.current = 0;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     void audioCtxRef.current?.close().catch(() => undefined);
     streamRef.current = null;

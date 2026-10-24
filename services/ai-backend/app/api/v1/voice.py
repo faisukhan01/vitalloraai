@@ -212,6 +212,36 @@ ws_logger = logging.getLogger("vitalora.voice")
 _RETRY_SAY = "I am sorry, I did not catch that. Could you say it again?"
 _BUSY_SAY = "Sorry, our system is a little busy right now. Could you please say that again in a moment?"
 
+# A transcript must contain at least one REAL character (letter or digit) in
+# any script we support — Latin, Cyrillic, Greek, Arabic, Devanagari, CJK,
+# kana. The ASR occasionally "recognizes" pure breath/noise as symbol-only
+# strings (measured live: a '#' transcript from silence) which previously
+# reached the caller's text field and confused the LLM. Symbol-only output is
+# treated exactly like empty output: no transcript, no LLM turn.
+_TRANSCRIPT_HAS_TEXT_RE = re.compile(
+    r"[0-9A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u4E00-\u9FFF\u3040-\u30FF]"
+)
+
+# Spoken replies must never carry written-language markup: the LLM sometimes
+# emits markdown (headers '#', bold '**', bullets '-', code ticks) and the TTS
+# then reads it aloud ('hash hash hash') or the text field shows raw symbols —
+# the exact '#' complaint. Stripped at BOTH sinks: every synthesis group and
+# the final transcript.
+_MARKUP_PATTERNS = re.compile(
+    r"```+|`+|^#{1,6}\s*|\s#{1,6}\s|\*\*|__|\*|\n+"  # fences, ticks, headers, bold/italics
+)
+
+
+def _strip_spoken_markup(text: str) -> str:
+    """Make LLM output safe to SPEAK and show: no markdown, no symbols noise."""
+    if not text:
+        return text
+    out = _MARKUP_PATTERNS.sub(" ", text)
+    out = re.sub(r"\s{2,}", " ", out).strip(" \t#*_`~-\u2013\u2014")
+    # Collapse fragments like "- " bullets left at word boundaries.
+    out = re.sub(r"(?:^|\s)[-•·]\s+", " ", out)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
 # ── Instant acknowledgment backchannel ───────────────────────────────────────
 # A real receptionist acknowledges instantly ("Mm-hmm", "One moment") before
 # looking up the answer. We pre-synthesize short ack lines in the session's
@@ -603,6 +633,9 @@ class _Speaker:
         self._start(text)
 
     async def _speak_one(self, text: str) -> None:
+        text = _strip_spoken_markup(text)  # TTS must never read markdown symbols
+        if not text:
+            return
         async with self._sem:
             if self._first_error is not None:
                 return
@@ -799,6 +832,19 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                     with suppress(ProviderError):
                         await asyncio.sleep(0.15)
                         user_text = await get_stt().transcribe(audio_b64, language)  # type: ignore[arg-type]
+                elif user_text and not _TRANSCRIPT_HAS_TEXT_RE.search(user_text):
+                    # Symbol-only "transcript" (e.g. '#' from breath noise):
+                    # the recognizer found no speech — retry once, then fall
+                    # through to the did-not-catch path. Never shown, never
+                    # forwarded to the LLM.
+                    log_extra(ws_logger, logging.WARNING, "stt symbol-only output — treating as no speech", raw_chars=len(user_text))
+                    user_text = ""
+                    if len(audio_b64) > 20_000:
+                        with suppress(ProviderError):
+                            await asyncio.sleep(0.15)
+                            retried = await get_stt().transcribe(audio_b64, language)  # type: ignore[arg-type]
+                            if retried and _TRANSCRIPT_HAS_TEXT_RE.search(retried):
+                                user_text = retried
                 log_extra(ws_logger, logging.INFO, "stt done", chars=len(user_text), ms=int((_time.perf_counter() - t0) * 1000))
                 websocket.state._t_stt_done = _time.perf_counter()
                 _bg(_record_usage(principal.organization_id, session_id, "stt_seconds", get_stt().name, 3.0))
@@ -877,7 +923,7 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                 stream_error = Exception("unexpected")
 
             turn_ms = int((_time.perf_counter() - t0) * 1000)
-            say_text = "".join(say_parts).strip()
+            say_text = _strip_spoken_markup("".join(say_parts).strip())
 
             if stream_error is not None and not say_text:
                 # Nothing could be produced (LLM/provider failure): apologize in

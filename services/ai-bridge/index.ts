@@ -904,6 +904,56 @@ async function handleTts(req: Request, startedAt: number): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
+// POST /websearch — live web search (gives the receptionist "all the data")
+// ---------------------------------------------------------------------------
+// Backs the orchestrator's `web_search` tool: when the caller asks a general
+// or current-events question the clinic knowledge base cannot answer (news,
+// "who built you", prices of anything, weather…), the LLM can look it up
+// here and answer like a general-purpose assistant instead of refusing.
+
+interface WebSearchResultItem {
+  url?: string;
+  name?: string;
+  snippet?: string;
+  host_name?: string;
+  date?: string;
+}
+
+async function handleWebSearch(req: Request, startedAt: number): Promise<Response> {
+  const body = await readJsonBody(req);
+  const query = body.query;
+  if (typeof query !== "string" || query.trim().length === 0) {
+    throw new ApiError(400, "invalid_request", "`query` must be a non-empty string");
+  }
+  if (query.length > 400) {
+    throw new ApiError(400, "invalid_request", "`query` exceeds 400 chars");
+  }
+  const num = validateNumber(body, "num", { min: 1, max: 10, required: false, fallback: 4 });
+
+  const zai = await getZai();
+  const raw = (await withTimeout(
+    withProviderRetries(() => zai.functions.invoke("web_search", { query: query.trim(), num })),
+    PROVIDER_TIMEOUT_MS,
+    "websearch",
+  )) as WebSearchResultItem[] | { results?: WebSearchResultItem[] };
+
+  const items: WebSearchResultItem[] = Array.isArray(raw)
+    ? raw
+    : Array.isArray(raw?.results)
+      ? raw.results
+      : [];
+  const results = items.slice(0, num).map((it) => ({
+    name: typeof it?.name === "string" ? it.name : "",
+    snippet: typeof it?.snippet === "string" ? it.snippet : "",
+    url: typeof it?.url === "string" ? it.url : "",
+    host_name: typeof it?.host_name === "string" ? it.host_name : "",
+    date: typeof it?.date === "string" ? it.date : "",
+  }));
+  logRequest("info", "/websearch", startedAt, 200, { chars: query.length, results: results.length });
+  return json(200, { results });
+}
+
+// ---------------------------------------------------------------------------
 // POST /tts/check — cache probe (no synthesis)
 // ---------------------------------------------------------------------------
 
@@ -981,6 +1031,13 @@ async function route(req: Request): Promise<Response> {
         return apiError(405, "method_not_allowed", "Use POST /tts");
       }
       return await handleTts(req, startedAt);
+    }
+
+    if (url.pathname === "/websearch") {
+      if (req.method !== "POST") {
+        return apiError(405, "method_not_allowed", "Use POST /websearch");
+      }
+      return await handleWebSearch(req, startedAt);
     }
 
     if (url.pathname === "/tts/check") {
