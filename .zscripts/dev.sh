@@ -80,5 +80,11 @@ else
 fi
 
 # ── 4) Web dashboard (this call blocks — it IS the dev server) ──────────────
+# After a sandbox reset node_modules is wiped; without this guard the boot
+# failed with "next: command not found" and the preview stayed dead forever.
+if [ ! -x apps/web/node_modules/.bin/next ]; then
+  log "web deps missing — running bun install (workspace root)"
+  bun install >> "$LOG_DIR/dev.log" 2>&1 || log "WARN: bun install failed"
+fi
 log "starting web on :3000 (bun run dev)"
 exec env API_PROXY_URL=http://127.0.0.1:81 NEXT_PUBLIC_API_PORT=8000 bun run dev

@@ -118,13 +118,18 @@ async def start_voice_session(
     speed = float(receptionist["speaking_speed"] or 1.0)
 
     async def _warm() -> None:
-        # One provider call every ~1.2s — never a burst. The greeting goes
-        # first because the WS "greet" frame lands within a second of session
-        # creation; every later fast path (ack, retry, busy) becomes a ~0ms
-        # cache hit within a few seconds.
+        # One provider call every ~1.2s — never a burst. The greeting's FIRST
+        # SPEECH GROUP goes first because the WS "greet" frame lands within a
+        # second of session creation and dispatches exactly this group key
+        # (_speak_stream_and_send → _split_speech_groups): the greet either
+        # cache-hits (~0ms) or joins the in-flight synthesis via the bridge
+        # dedupe. Warming the FULL greeting text measured 6.7s before the
+        # caller heard anything — the first group is what first audio needs.
         if greeting_text:
-            with suppress(ProviderError, Exception):
-                await get_tts().synthesize(greeting_text, voice=voice, speed=speed)
+            greeting_groups = _split_speech_groups(greeting_text)
+            if greeting_groups:
+                with suppress(ProviderError, Exception):
+                    await get_tts().synthesize(greeting_groups[0], voice=voice, speed=speed)
         # Warm ONLY the first ack line + the retry/busy phrases: the provider
         # throttles bursts, and a full ack-line sweep right at session start
         # burns rate budget exactly when the caller's first turn needs it.
@@ -529,6 +534,17 @@ class _Speaker:
                 if rest:
                     self._tasks.append(asyncio.ensure_future(self._speak_one(rest)))
                 return
+            # No comma/clause boundary anywhere: hard word-split so the first
+            # synthesis stays ~2s. A 68+ char request measures ~3.8s — a
+            # multi-second latency bomb for first audio.
+            if len(text) > _HARD_FIRST_MAX:
+                a, b = _hard_word_split(text, _FIRST_GROUP_MAX + 15)
+                log_extra(ws_logger, logging.INFO, "hard first split", lead=len(a), rest=len(b))
+                self._tasks.append(asyncio.ensure_future(self._speak_one(a)))
+                rest = b.strip()
+                if rest:
+                    self._tasks.append(asyncio.ensure_future(self._speak_one(rest)))
+                return
         self._tasks.append(asyncio.ensure_future(self._speak_one(text)))
 
     def _last_sentence_boundary(self) -> re.Match | None:
@@ -538,7 +554,17 @@ class _Speaker:
         return boundary
 
     def feed_delta(self, delta: str) -> None:
-        """Accumulate streamed text; dispatch every speakable group."""
+        """Accumulate streamed text; dispatch every speakable group.
+
+        Measured reality: the z-ai SDK delivers the whole completion as ONE
+        end-of-generation burst, so a multi-sentence reply usually arrives as
+        a single delta. Dispatching at the LAST boundary (the old logic) then
+        collapsed the entire reply into one huge synthesis request (~4-8s of
+        dead air). Cutting at the FIRST sentence boundary — merging any
+        too-short leading fragment like "Yes." into the first group — turns
+        the burst into several SHORT sequential requests: first audio plays
+        ~2s after the burst instead of after the whole reply.
+        """
         self._buffer += delta
         while True:
             if not self._tasks and len(self._buffer) > _FIRST_GROUP_MAX:
@@ -554,10 +580,14 @@ class _Speaker:
                         lead, self._buffer = self._buffer[: clause.start()], self._buffer[clause.start():]
                         self._start(lead)
                         continue
-            boundary = self._last_sentence_boundary()
-            if boundary is None or boundary.end() < _FIRST_SENTENCE_MIN:
+            first: re.Match | None = None
+            for cand in _SENTENCE_END_RE.finditer(self._buffer):
+                first = cand
+                if cand.end() >= _FIRST_SENTENCE_MIN:
+                    break
+            if first is None or first.end() < _FIRST_SENTENCE_MIN:
                 return
-            sentence, self._buffer = self._buffer[: boundary.end()].strip(), self._buffer[boundary.end():]
+            sentence, self._buffer = self._buffer[: first.end()].strip(), self._buffer[first.end():]
             if sentence:
                 self._start(sentence)
 
@@ -715,17 +745,15 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                     await websocket.send_json({"type": "transcript", "role": "assistant", "text": greeting})
                     _bg(_persist_message(session_id, principal.organization_id, "assistant", greeting))
                     try:
-                        # The session-start warmer synthesizes the FULL greeting
-                        # text. On a warm hit this is a ~0ms cache-hit request.
-                        # On a miss the warm synthesis is still in flight — a
-                        # single full-text request here DEDUPES against it in
-                        # the bridge (same voice+speed+text key), so the
-                        # greeting never fires burst traffic. Splitting the
-                        # greeting into groups would MISS the warm key and add
-                        # 1-2 fresh provider calls — exactly the burst pattern
-                        # that trips 429 throttling (one 429 retry = 0.6-1.6 s
-                        # of dead air before the caller hears anything).
-                        await _speak_and_send(websocket, greeting, voice_id, speed)
+                        # The session-start warmer synthesizes the FIRST SPEECH
+                        # GROUP of the greeting (same _split_speech_groups key
+                        # the greet dispatch below uses), so group 1 is a
+                        # ~0ms cache hit or an in-flight dedupe join, and the
+                        # caller hears the receptionist within ~1-2s. Full-text
+                        # warming measured 6.7s of dead air before the greeting
+                        # started, and splitting would MISS a full-text warm
+                        # key — so the warm key IS the first group.
+                        await _speak_stream_and_send(websocket, greeting, voice_id, speed)
                     except ProviderError:
                         await websocket.send_json({"type": "error", "message": "Voice synthesis failed; showing text only."})
                 await websocket.send_json({"type": "status", "stage": "listening"})

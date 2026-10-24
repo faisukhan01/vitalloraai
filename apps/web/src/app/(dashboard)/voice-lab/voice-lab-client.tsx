@@ -41,9 +41,15 @@ interface Turn extends Pick<ConversationMessage, "role" | "content" | "tool_name
   id: string;
 }
 
-const SILENCE_MS = 330; // snappy phone-like turn taking: send ~1/3s after the caller stops
+// Endpointing: real callers pause 300-600ms mid-sentence between phrases.
+// A 330ms window chopped sentences in half, so the recognizer received
+// fragments, the AI answered the wrong fragment, and callers had to repeat
+// themselves — the single worst latency killer in the whole pipeline.
+// 900ms is the classic phone-system endpointing window: turn taking still
+// feels snappy, but a mid-sentence breath never fires the send.
+const SILENCE_MS = 900;
 const MAX_UTTERANCE_MS = 15000;
-const MIN_UTTERANCE_MS = 250; // accept short utterances ("yes") quickly, still discard blips
+const MIN_UTTERANCE_MS = 320; // accept short utterances ("yes") quickly, still discard blips
 const CALIBRATION_FRAMES = 12; // ~0.2 s ambient-noise sampling — barely delays first capture
 const LOW_MIC_HINT_MS = 4500;
 
@@ -272,6 +278,10 @@ export function VoiceLabClient() {
   // Low-mic hint state
   const quietMsRef = useRef(0);
   const lastTickRef = useRef(0);
+  // Set while assistant audio is queued but held back because the caller's
+  // microphone is mid-utterance: playback starts the moment the utterance is
+  // flushed, so the assistant never talks over (or discards) live speech.
+  const holdForMicRef = useRef(false);
 
   stageRef.current = stage;
   mutedRef.current = muted;
@@ -303,6 +313,7 @@ export function VoiceLabClient() {
   const stopAudio = useCallback(() => {
     playbackGenRef.current += 1;
     pumpingRef.current = false;
+    holdForMicRef.current = false;
     for (const s of scheduledSrcsRef.current) {
       try {
         s.onended = null;
@@ -433,23 +444,51 @@ export function VoiceLabClient() {
   }, [pumpQueue]);
 
   // ── Microphone capture + VAD ────────────────────────────────────────────
+  // Starts playback of any assistant audio that was held while the caller was
+  // still speaking (see the "audio" WS handler). Called from sendUtterance so
+  // the held reply begins the instant the utterance is flushed — even when the
+  // recording turned out to be a discarded blip.
+  const releaseHeldAudio = useCallback(() => {
+    if (!holdForMicRef.current) return;
+    holdForMicRef.current = false;
+    if (audioQueueRef.current.length > 0 && !audioPlayingRef.current && !pumpingRef.current) {
+      // Take the speaking state BEFORE pumping: the mic must disarm (barge-in
+      // ownership) the instant held assistant audio starts, or the recorder
+      // would capture the assistant's own voice.
+      speakingRef.current = true;
+      setStage("speaking");
+      void pumpQueue();
+    }
+  }, [pumpQueue]);
+
   const sendUtterance = useCallback(
     async (blob: Blob, mimeType: string) => {
       const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        releaseHeldAudio();
+        return;
+      }
       // Preferred path: decoded, resampled, peak-normalized WAV.
       const wav = audioCtxRef.current ? await blobToWav16k(blob, audioCtxRef.current) : null;
       if (wav) {
-        if (wav.durationMs < MIN_UTTERANCE_MS) return; // noise blip — discard silently
+        if (wav.durationMs < MIN_UTTERANCE_MS) {
+          releaseHeldAudio(); // noise blip — discard, but never strand held audio
+          return;
+        }
         ws.send(JSON.stringify({ type: "audio", data: wav.b64 }));
+        releaseHeldAudio();
         return;
       }
       // Fallback: upload the raw recording (recognizer handles webm/mp4/ogg too).
       const buf = await blob.arrayBuffer();
-      if (buf.byteLength < 1200) return;
+      if (buf.byteLength < 1200) {
+        releaseHeldAudio();
+        return;
+      }
       ws.send(JSON.stringify({ type: "audio", data: await blobToRawBase64(new Blob([buf], { type: mimeType })) }));
+      releaseHeldAudio();
     },
-    [],
+    [releaseHeldAudio],
   );
 
   const stopRecording = useCallback(() => {
@@ -509,6 +548,14 @@ export function VoiceLabClient() {
       }
       const threshold = thresholdRef.current;
 
+      // The mic arms for the WHOLE active call — not only the "listening"
+      // stage. Previously the recorder disarmed during transcribing/thinking,
+      // so any speech the caller produced while the AI was working (1.5-3s per
+      // turn) was silently dropped — the #1 "it is not listening to me"
+      // complaint. The server processes frames sequentially, so an early next
+      // utterance simply queues as the following turn. During assistant
+      // playback the barge-in branch owns the mic instead.
+      const micArmed = st === "listening" || st === "transcribing" || st === "thinking" || st === "thinking_ack";
       if (speakingRef.current) {
         // Barge-in: sustained caller speech interrupts assistant playback.
         if (rms > threshold) {
@@ -521,7 +568,7 @@ export function VoiceLabClient() {
         } else {
           speechFrames = 0;
         }
-      } else if (st === "listening" && !mutedRef.current) {
+      } else if (micArmed && !mutedRef.current) {
         if (rms > threshold) {
           quietMsRef.current = 0;
           if (!recordingRef.current) startRecording();
@@ -688,6 +735,7 @@ export function VoiceLabClient() {
           format?: string;
           data?: string;
           message?: string;
+          ack?: boolean;
         };
         switch (msg.type) {
           case "status":
@@ -705,10 +753,35 @@ export function VoiceLabClient() {
             break;
           case "audio": {
             if (msg.data) {
-              // Echo guard: if a recording is already in flight when assistant
-              // audio arrives (caller began speaking during the think/ack gap),
-              // discard it — it is contaminated with the assistant's own voice.
+              const binary = atob(msg.data);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+              const chunk: AudioChunk = {
+                bytes: bytes.buffer,
+                mime: msg.format === "mp3" ? "audio/mpeg" : "audio/wav",
+              };
+
+              if (recordingRef.current && !speakingRef.current && !audioPlayingRef.current && !pumpingRef.current) {
+                if (msg.ack) {
+                  // A backchannel ack is worthless once the caller has kept
+                  // the floor — drop it instead of queuing stale audio.
+                  break;
+                }
+                // Caller is mid-utterance and nothing is playing yet: the
+                // recording is pure caller speech (the mic never arms while
+                // the assistant talks), so DISCARDING it — the old behaviour —
+                // silently ate half of every conversation. HOLD the reply
+                // instead: playback starts the moment the utterance flushes
+                // (sendUtterance → releaseHeldAudio).
+                audioQueueRef.current.push(chunk);
+                holdForMicRef.current = true;
+                setStage("listening");
+                break;
+              }
               if (recordingRef.current) {
+                // Recording in flight while assistant audio IS playing: the
+                // recording began during playback (barged-in) and is
+                // contaminated with the assistant's own voice — discard it.
                 if (silenceTimerRef.current) {
                   clearTimeout(silenceTimerRef.current);
                   silenceTimerRef.current = null;
@@ -716,15 +789,9 @@ export function VoiceLabClient() {
                 chunksRef.current = [];
                 stopRecording();
               }
-              const binary = atob(msg.data);
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
               speakingRef.current = true;
               setStage("speaking");
-              audioQueueRef.current.push({
-                bytes: bytes.buffer,
-                mime: msg.format === "mp3" ? "audio/mpeg" : "audio/wav",
-              });
+              audioQueueRef.current.push(chunk);
               if (!audioPlayingRef.current && !pumpingRef.current) void pumpQueue();
             }
             break;
