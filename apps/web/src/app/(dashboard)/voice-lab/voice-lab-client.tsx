@@ -68,6 +68,52 @@ interface WavPacket {
   durationMs: number;
 }
 
+// ── Browser-native speech recognition (PRIMARY speech-to-text) ──────────────
+// Chrome/Edge/Safari ship a Web Speech recognizer with Google-grade accuracy,
+// streaming interim results and its own endpointing. Using it as the primary
+// recognizer mirrors how ChatGPT's voice mode feels: words appear WHILE the
+// caller speaks, and the turn is sent the moment the phrase completes —
+// no audio upload, no server STT round-trip, no provider rate limits.
+// The server STT path stays as an automatic fallback for browsers without
+// the API or when the recognizer errors out mid-call.
+interface SpeechRecognitionAlternativeLike {
+  transcript: string;
+}
+interface SpeechRecognitionResultLike {
+  isFinal: boolean;
+  length: number;
+  [index: number]: SpeechRecognitionAlternativeLike;
+}
+interface SpeechRecognitionEventLike {
+  resultIndex: number;
+  results: { length: number; [index: number]: SpeechRecognitionResultLike };
+}
+interface SpeechRecognitionLike {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start(): void;
+  stop(): void;
+  abort(): void;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+}
+type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
+
+function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as { SpeechRecognition?: SpeechRecognitionCtor; webkitSpeechRecognition?: SpeechRecognitionCtor };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
+
+const BROWSER_STT_LANG: Record<string, string> = {
+  en: "en-US",
+  ur: "ur-PK",
+  hi: "hi-IN",
+  ar: "ar-SA",
+};
+
 interface AudioChunk {
   bytes: ArrayBuffer;
   mime: string;
@@ -356,6 +402,15 @@ export function VoiceLabClient() {
   const utteranceRef = useRef<Float32Array[]>([]);
   const utteranceFramesRef = useRef(0);
   const utteranceSilenceMsRef = useRef(0);
+  // ── Browser-native recognizer (primary STT) state ────────────────────────
+  const recogRef = useRef<SpeechRecognitionLike | null>(null);
+  const browserSttRef = useRef(false); // true → the browser recognizer owns turns
+  const recogRunningRef = useRef(false);
+  const recogRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recogFailuresRef = useRef(0); // exponential backoff across restarts
+  const [browserSttActive, setBrowserSttActive] = useState(false);
+  // Live partial transcript while the caller speaks (ChatGPT-style ghost text)
+  const [interimText, setInterimText] = useState("");
 
   stageRef.current = stage;
   mutedRef.current = muted;
@@ -538,6 +593,14 @@ export function VoiceLabClient() {
   /** Send a captured utterance: resample → normalize → trim silence → WAV. */
   const sendPcmUtterance = useCallback(
     (chunks: Float32Array[], frameCount: number, rate: number) => {
+      // Browser-native recognition owns turns when available — uploading the
+      // same utterance as audio would DOUBLE every turn (text + server STT).
+      // The PCM pipeline still runs for levels/barge-in; its utterances are
+      // simply not sent.
+      if (browserSttRef.current) {
+        releaseHeldAudio();
+        return;
+      }
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN || frameCount <= 0) {
         releaseHeldAudio();
@@ -574,6 +637,10 @@ export function VoiceLabClient() {
 
   const sendUtterance = useCallback(
     async (blob: Blob, mimeType: string) => {
+      if (browserSttRef.current) {
+        releaseHeldAudio(); // browser recognizer owns turns — see sendPcmUtterance
+        return;
+      }
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         releaseHeldAudio();
@@ -915,9 +982,156 @@ export function VoiceLabClient() {
     setLevel(0);
   }, [stopRecording]);
 
+  // ── Browser-native speech recognition (primary STT) ─────────────────────
+  const clearRecogRestartTimer = useCallback(() => {
+    if (recogRestartTimerRef.current) {
+      clearTimeout(recogRestartTimerRef.current);
+      recogRestartTimerRef.current = null;
+    }
+  }, []);
+
+  const stopBrowserRecognition = useCallback(() => {
+    clearRecogRestartTimer();
+    const rec = recogRef.current;
+    recogRef.current = null;
+    recogRunningRef.current = false;
+    if (rec) {
+      rec.onresult = null;
+      rec.onend = null;
+      rec.onerror = null;
+      try {
+        rec.abort();
+      } catch {
+        /* already stopped */
+      }
+    }
+    setInterimText("");
+  }, [clearRecogRestartTimer]);
+
+  const startBrowserRecognition = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!browserSttRef.current || mutedRef.current || speakingRef.current || audioPlayingRef.current) return;
+    if (recogRunningRef.current || recogRef.current) return;
+
+    const Ctor = getSpeechRecognitionCtor();
+    if (!Ctor) return;
+    const rec = new Ctor();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = BROWSER_STT_LANG[language] ?? "en-US";
+
+    rec.onresult = (event) => {
+      recogFailuresRef.current = 0;
+      // Echo guard: never accept results captured while the assistant's own
+      // voice is out of the speakers (recognition is aborted during playback;
+      // this catches the stragglers that were already in flight).
+      if (speakingRef.current || audioPlayingRef.current) return;
+      // The recognizer arms slightly before the greeting's first audio chunk
+      // arrives — without this guard it would transcribe the greeting's first
+      // word and send it back as a phantom caller turn.
+      if (stageRef.current === "connecting") return;
+      let interim = "";
+      let final = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (!result) continue;
+        const alt = result[0];
+        if (!alt) continue;
+        if (result.isFinal) final += alt.transcript;
+        else interim += alt.transcript;
+      }
+      if (interim.trim()) {
+        setInterimText(interim.trim());
+      }
+      const finalText = final.replace(/\s+/g, " ").trim();
+      if (finalText.length >= 2 && /[\p{L}\p{N}]/u.test(finalText)) {
+        // Must contain real letters/digits — pure punctuation or '#' noise is
+        // discarded instead of becoming a ghost turn.
+        setInterimText("");
+        const sock = wsRef.current;
+        if (sock && sock.readyState === WebSocket.OPEN) {
+          sock.send(JSON.stringify({ type: "text", data: finalText.slice(0, 4000) }));
+          setStage("thinking");
+        }
+      }
+    };
+
+    rec.onerror = (event) => {
+      const kind = event.error;
+      if (kind === "not-allowed" || kind === "service-not-allowed" || kind === "audio-capture") {
+        // Browser recognition is unavailable (permission/iframe policy) —
+        // fall back to the server audio path for the rest of the call.
+        browserSttRef.current = false;
+        setBrowserSttActive(false);
+        stopBrowserRecognition();
+      }
+      // "no-speech" / "network" / "aborted" → onend decides whether to restart.
+    };
+
+    rec.onend = () => {
+      recogRunningRef.current = false;
+      if (recogRef.current !== rec) return; // replaced/stopped intentionally
+      recogRef.current = null;
+      // Auto-restart with exponential backoff while the call is live, the mic
+      // is armed and the assistant is not talking. Chrome ends the recognizer
+      // after every pause — continuous conversation needs this loop.
+      if (!browserSttRef.current || mutedRef.current || speakingRef.current || audioPlayingRef.current) return;
+      const st = stageRef.current;
+      if (st === "ended" || st === "error" || st === "idle") return;
+      const failures = Math.min(recogFailuresRef.current, 4);
+      const delay = failures === 0 ? 180 : Math.min(250 * 2 ** failures, 3000);
+      clearRecogRestartTimer();
+      recogRestartTimerRef.current = setTimeout(() => {
+        recogRestartTimerRef.current = null;
+        startBrowserRecognition();
+      }, delay);
+    };
+
+    recogRef.current = rec;
+    try {
+      rec.start();
+      recogRunningRef.current = true;
+      setBrowserSttActive(true);
+    } catch {
+      recogRef.current = null;
+      recogRunningRef.current = false;
+    }
+  }, [clearRecogRestartTimer, language, stopBrowserRecognition]);
+
+  /** Pause recognition while assistant audio plays (echo-proof turn taking). */
+  const pauseBrowserRecognition = useCallback(() => {
+    if (!browserSttRef.current) return;
+    const rec = recogRef.current;
+    if (rec) {
+      try {
+        rec.abort();
+      } catch {
+        /* already stopped */
+      }
+      recogRef.current = null;
+      recogRunningRef.current = false;
+    }
+    setInterimText("");
+  }, []);
+
+  /** Resume recognition after assistant playback finishes / unmute. */
+  const resumeBrowserRecognition = useCallback(() => {
+    if (!browserSttRef.current) return;
+    clearRecogRestartTimer();
+    recogRestartTimerRef.current = setTimeout(() => {
+      recogRestartTimerRef.current = null;
+      startBrowserRecognition();
+    }, 220);
+  }, [clearRecogRestartTimer, startBrowserRecognition]);
+
   // ── Call lifecycle ──────────────────────────────────────────────────────
   const endCall = useCallback(
     async (reason: string) => {
+      // Kill the browser recognizer first so it cannot restart mid-teardown.
+      browserSttRef.current = false;
+      setBrowserSttActive(false);
+      stopBrowserRecognition();
       wsRef.current?.send(JSON.stringify({ type: "end" }));
       wsRef.current?.close();
       wsRef.current = null;
@@ -939,7 +1153,7 @@ export function VoiceLabClient() {
         }
       }
     },
-    [stopAudio, teardownMic],
+    [stopAudio, stopBrowserRecognition, teardownMic],
   );
 
   const startCall = useCallback(async () => {
@@ -948,6 +1162,10 @@ export function VoiceLabClient() {
     // browsers expire the gesture after the first async step, and audio can
     // only be unlocked while the gesture is live. See ensureAudioUnlocked.
     ensureAudioUnlocked(audioCtxRef, audioElRef);
+    // Decide the STT path up front: the browser's native recognizer (primary,
+    // ChatGPT-style live transcript) or the server audio path (fallback).
+    browserSttRef.current = getSpeechRecognitionCtor() !== null;
+    setBrowserSttActive(browserSttRef.current);
     setErrorMsg(null);
     setMicError(null);
     setMicHint(null);
@@ -966,6 +1184,8 @@ export function VoiceLabClient() {
         speakingRef.current = false;
         resetVadCalibration();
         setStage((s) => (s === "ended" || s === "error" ? s : "listening"));
+        // Assistant finished talking → the caller can speak again.
+        resumeBrowserRecognition();
       };
       finishPlaybackRef.current = finishPlayback;
 
@@ -989,9 +1209,15 @@ export function VoiceLabClient() {
             if (msg.stage === "listening") resetVadCalibration();
             if (msg.stage) setStage(msg.stage as Stage);
             break;
-          case "transcript":
-            addTurn((msg.role ?? "assistant") as Turn["role"], msg.text ?? "");
+          case "transcript": {
+            const tText = msg.text ?? "";
+            const tRole = (msg.role ?? "assistant") as Turn["role"];
+            // Belt-and-braces: a user transcript made only of symbols (the
+            // recognizer's '#' breath artifact) is never rendered, never kept.
+            if (tRole === "user" && !/[\p{L}\p{N}]/u.test(tText)) break;
+            addTurn(tRole, tText);
             break;
+          }
           case "tool":
             addTurn("tool", null, msg.tool);
             break;
@@ -1035,6 +1261,9 @@ export function VoiceLabClient() {
               }
               speakingRef.current = true;
               setStage("speaking");
+              // Assistant takes the floor: the browser recognizer must not
+              // hear (and transcribe) the assistant's own TTS voice.
+              pauseBrowserRecognition();
               audioQueueRef.current.push(chunk);
               if (!audioPlayingRef.current && !pumpingRef.current) void pumpQueue();
             }
@@ -1074,6 +1303,9 @@ export function VoiceLabClient() {
       // the call continues in keyboard mode (full pipeline, typed turns).
       ws.send(JSON.stringify({ type: "greet" }));
       void setupMic();
+      // Arm the browser-native recognizer (primary STT) — it owns the live
+      // transcript and turn submission; the server audio path is the fallback.
+      if (browserSttRef.current) startBrowserRecognition();
     } catch (err) {
       setStage("error");
       if (err instanceof ApiError) {
@@ -1082,15 +1314,27 @@ export function VoiceLabClient() {
         setErrorMsg("Could not start the call. Verify the backend and ai-bridge services are running, then try again.");
       }
     }
-  }, [addTurn, language, pumpQueue, receptionistId, resetVadCalibration, setupMic, stopAudio, stopRecording]);
+  }, [addTurn, language, pauseBrowserRecognition, pumpQueue, receptionistId, resetVadCalibration, resumeBrowserRecognition, setupMic, startBrowserRecognition, stopAudio, stopRecording]);
+
+  // Mute gates the browser recognizer too: muted → stop listening entirely.
+  useEffect(() => {
+    if (muted) {
+      pauseBrowserRecognition();
+    } else if (sessionId) {
+      resumeBrowserRecognition();
+    }
+  }, [muted, sessionId, pauseBrowserRecognition, resumeBrowserRecognition]);
 
   useEffect(() => {
     return () => {
+      browserSttRef.current = false;
+      stopBrowserRecognition();
       wsRef.current?.close();
       teardownMic();
       const sid = sessionRef.current;
       if (sid) void api.endVoiceSession(sid, "caller_ended").catch(() => undefined);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Waveform bars animate from the live microphone RMS (genuinely audio-driven).
@@ -1249,7 +1493,7 @@ export function VoiceLabClient() {
                 />
               </span>
             )}
-            <span>{muted ? "Microphone muted" : micError ? "Keyboard mode" : isActive ? "Microphone live" : "Microphone off"}</span>
+            <span>{muted ? "Microphone muted" : micError ? "Keyboard mode" : isActive ? (browserSttActive ? "Live mic · instant transcription" : "Microphone live") : "Microphone off"}</span>
           </div>
         </div>
 
@@ -1286,27 +1530,41 @@ export function VoiceLabClient() {
               description="Start a call and speak — or type a message below. The transcript, tool actions and audio responses you see here are produced live by the real AI pipeline."
             />
           ) : (
-            turns.map((t) =>
-              t.role === "tool" ? (
-                <div key={t.id} className="flex justify-center">
-                  <span className="rounded-full border border-teal-200 bg-teal-50 px-3 py-1 font-mono text-xs text-teal-700 dark:border-teal-500/30 dark:bg-teal-500/10 dark:text-teal-300">
-                    ⚙ {t.tool_name}
-                  </span>
-                </div>
-              ) : (
+            <>
+              {turns.map((t) =>
+                t.role === "tool" ? (
+                  <div key={t.id} className="flex justify-center">
+                    <span className="rounded-full border border-teal-200 bg-teal-50 px-3 py-1 font-mono text-xs text-teal-700 dark:border-teal-500/30 dark:bg-teal-500/10 dark:text-teal-300">
+                      ⚙ {t.tool_name}
+                    </span>
+                  </div>
+                ) : (
+                  <motion.div
+                    key={t.id}
+                    initial={{ opacity: 0, y: 6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                      t.role === "user" ? "ml-auto bg-teal-600 text-white" : "glass-subtle mr-auto"
+                    }`}
+                  >
+                    <span className="sr-only">{t.role === "user" ? "Caller" : "Receptionist"}: </span>
+                    {t.content}
+                  </motion.div>
+                ),
+              )}
+              {interimText && (
                 <motion.div
-                  key={t.id}
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                    t.role === "user" ? "ml-auto bg-teal-600 text-white" : "glass-subtle mr-auto"
-                  }`}
+                  key="interim"
+                  initial={{ opacity: 0.5 }}
+                  animate={{ opacity: 0.8 }}
+                  className="ml-auto max-w-[85%] rounded-2xl border border-dashed border-teal-400/60 bg-teal-600/10 px-4 py-2.5 text-sm italic leading-relaxed text-teal-700 dark:text-teal-300"
+                  aria-live="polite"
                 >
-                  <span className="sr-only">{t.role === "user" ? "Caller" : "Receptionist"}: </span>
-                  {t.content}
+                  <span className="sr-only">You are saying: </span>
+                  {interimText}…
                 </motion.div>
-              ),
-            )
+              )}
+            </>
           )}
         </div>
         <div className="mt-4 flex gap-2 border-t border-black/5 pt-4 dark:border-white/10">

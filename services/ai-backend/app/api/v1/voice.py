@@ -209,8 +209,8 @@ async def end_voice_session(
 
 ws_logger = logging.getLogger("vitalora.voice")
 
-_RETRY_SAY = "I am sorry, I did not catch that. Could you say it again?"
-_BUSY_SAY = "Sorry, our system is a little busy right now. Could you please say that again in a moment?"
+_RETRY_SAY = "Sorry, I didn't catch that — could you say it again?"
+_BUSY_SAY = "Sorry, I need just a moment here — could you say that again for me?"
 
 # A transcript must contain at least one REAL character (letter or digit) in
 # any script we support — Latin, Cyrillic, Greek, Arabic, Devanagari, CJK,
@@ -821,9 +821,18 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                 t0 = _time.perf_counter()
                 try:
                     user_text = await get_stt().transcribe(audio_b64, language)  # type: ignore[arg-type]
-                except ProviderError:
+                except ProviderError as exc:
                     await _persist_message(session_id, principal.organization_id, "system", "stt_error")
-                    await websocket.send_json({"type": "error", "message": "Speech recognition failed. Please try again."})
+                    # The socket may already be gone (caller hung up / client
+                    # timed out while the provider retries ran) — never crash
+                    # the handler on a failed error-report send.
+                    with suppress(Exception):  # noqa: BLE001
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "I couldn't hear that clearly — the recognition service is busy for a moment. Say it again, or type your message below.",
+                            "kind": "stt_unavailable",
+                            "detail": str(exc)[:200] if exc else None,
+                        })
                     continue
                 if not user_text and len(audio_b64) > 20_000:
                     # Substantial audio but no transcript: transient recognizer

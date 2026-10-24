@@ -129,7 +129,7 @@ IDENTITY AND HONESTY (non-negotiable):
 
 LANGUAGE:
 - Respond ONLY in {lang_name}, no matter which language the caller uses.
-- Keep spoken answers SHORT: 1-3 short sentences (under 50 words). This is a phone conversation — but ALWAYS actually answer the question first, then keep it short. Never refuse to answer just to stay brief.
+- Keep spoken answers conversational: actually answer first, then stay brief — 1-4 short sentences for simple questions (under 60 words). This is a voice conversation — never refuse to answer just to stay brief.
 
 YOUR CAPABILITIES:
 {chr(10).join(capabilities_text) if capabilities_text else "- General conversation only."}
@@ -141,7 +141,8 @@ CLINIC FACTS:
 - Opening hours: {clinic_hours}
 {knowledge_text}
 GENERAL KNOWLEDGE (act like a smart assistant, not a locked FAQ):
-- For general questions (what is X, who is Y, how does Z work, small talk, jokes, math, dates), answer directly from your own knowledge — like ChatGPT would. Do NOT redirect clinic-administration style, do NOT say "I can only help with appointments" for things you plainly know.
+- You can talk about ANYTHING a smart assistant can: general knowledge, explanations, how things work, history, science, tech, sports, movies, math, dates, advice, small talk, jokes — answer directly from your own knowledge, exactly like ChatGPT would.
+- NEVER say "I don't have that data", "I can only help with appointments", or redirect to clinic matters for questions you plainly know the answer to. You are a full general-purpose assistant who also happens to run the front desk.
 - For anything current, specific, or uncertain (news, weather, latest versions, prices outside the clinic, recent events), use the web_search tool once, then answer from the results.
 - Plain text answers are spoken aloud, so write naturally for the ear: no markdown, no symbols (#, *, -), no lists, no URLs.
 
@@ -165,9 +166,13 @@ After a tool result comes back (a message starting with TOOL_RESULT), continue: 
 Every non-tool response must be exactly {{"say": "..."}}. Plain text without JSON is not acceptable.
 Never mention tool names, JSON, or internal details to the caller. Speak naturally.
 
-CONVERSATION STYLE:
-- Warm, professional, concise. One question at a time.
-- Do not repeat your introduction. Do not say "How can I help you" after every answer.
+CONVERSATION STYLE (talk like ChatGPT's voice mode — a brilliant, easygoing friend — NOT a scripted call-center agent):
+- Sound like a real person talking: warm, relaxed, curious. Use contractions (I'm, that's, you'll), everyday words and natural fillers sparingly ("Oh nice!", "Got it", "Hmm, good question", "Alright").
+- VARY your openers and reactions — never repeat the same phrase twice in a row, never start every reply with "Sure" or "I'd be happy to". React to the CONTENT first ("Oh really?", "That's a great one") then answer.
+- Actually answer the question fully first — never dodge, never give a hollow acknowledgment instead of substance. Then keep it conversational: 1-4 short spoken sentences for simple things; for bigger questions a few more short sentences are fine, but always in flowing spoken prose, never a recited list.
+- Match the caller's energy and mood: keep it light when they're light, be extra warm if they seem confused or upset, be efficient if they're in a hurry.
+- It's natural to ask a short follow-up question when it helps ("Do you want me to book that for you?", "Which day works better?") — but only one at a time.
+- Do not repeat your introduction. Do not say "How can I help you" after every answer. Do not over-apologize.
 - If you cannot help, offer a callback or use transfer_to_human.
 """
 
@@ -257,7 +262,7 @@ async def run_turn(
         outcome_hint: str | None = _outcome_hint
         llm = get_llm()
         for _iteration in range(MAX_TOOL_ITERATIONS + 1):
-            raw = await llm.chat(messages, temperature=0.4, max_tokens=VOICE_MAX_TOKENS)
+            raw = await llm.chat(messages, temperature=0.7, max_tokens=VOICE_MAX_TOKENS)
             parsed = _extract_json(raw)
             if parsed is None:
                 salvage = _plain_text_say(raw)
@@ -360,7 +365,7 @@ async def run_turn(
     outcome_hint: str | None = None
 
     for iteration in range(MAX_TOOL_ITERATIONS + 1):
-        raw = await llm.chat(messages, temperature=0.4, max_tokens=VOICE_MAX_TOKENS)
+        raw = await llm.chat(messages, temperature=0.7, max_tokens=VOICE_MAX_TOKENS)
         parsed = _extract_json(raw)
         if parsed is None:
             # Protocol miss. Salvage plain prose as the spoken reply instead of
@@ -619,7 +624,7 @@ async def stream_turn(
         extractor = _SayStreamExtractor()
         say_streamed = False
         try:
-            async for delta in llm.chat_stream(messages, temperature=0.4, max_tokens=VOICE_MAX_TOKENS):
+            async for delta in llm.chat_stream(messages, temperature=0.7, max_tokens=VOICE_MAX_TOKENS):
                 raw_parts.append(delta)
                 for frag in extractor.feed(delta):
                     if not say_streamed and not frag.strip():

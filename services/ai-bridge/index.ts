@@ -25,6 +25,12 @@ import ZAI from "z-ai-web-dev-sdk";
 
 const PORT: number = Number.parseInt(process.env.AI_BRIDGE_PORT ?? "", 10) || 8100;
 
+// The "brain" of the AI. glm-4-plus (the SDK default) is hard rate-limited on
+// this gateway (measured: 429 on nearly every burst), while glm-4.6 — the
+// newest flagship — answers in ~0.4s and is dramatically better at natural
+// conversation, general knowledge and tool-calling. Override-able via env.
+const LLM_MODEL: string = process.env.AI_BRIDGE_LLM_MODEL ?? "glm-4.6";
+
 const MAX_BODY_BYTES = 40 * 1024 * 1024; // ~40MB (STT audio arrives base64)
 const MAX_STT_DECODED_BYTES = 25 * 1024 * 1024; // 25MB decoded
 const MAX_LLM_MESSAGES = 40;
@@ -58,7 +64,11 @@ const RETRYABLE_PROVIDER_STATUS_RE = /API request failed with status (?:429|500|
 // Retry backoff with randomized jitter: consecutive voice-pipeline calls that
 // burst together would otherwise retry in lockstep and re-trigger the same
 // provider 429 window. Jitter spreads the retries across ~1-2s and ~2-4s.
-const PROVIDER_RETRY_DELAYS_MS = [600, 1_600, 3_200] as const;
+const PROVIDER_RETRY_DELAYS_MS = [800, 2_000, 4_500, 8_000] as const;
+// Server-side STT is now only a FALLBACK (the browser's native recognizer is
+// primary), so it can afford a patient backoff that outlives the provider's
+// 429 window instead of failing the caller mid-conversation.
+const STT_RETRY_DELAYS_MS = [1_000, 2_500, 5_000, 8_000] as const;
 const PROVIDER_RETRY_JITTER_MS = 400;
 
 // ---------------------------------------------------------------------------
@@ -151,11 +161,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
  * retries are exhausted the last error is thrown and mapped to 502 — no fake
  * success, ever.
  */
-async function withProviderRetries<T>(fn: () => Promise<T>): Promise<T> {
+async function withProviderRetries<T>(fn: () => Promise<T>, delays: readonly number[] = PROVIDER_RETRY_DELAYS_MS): Promise<T> {
   let lastError: unknown;
-  for (let attempt = 0; attempt <= PROVIDER_RETRY_DELAYS_MS.length; attempt++) {
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
     if (attempt > 0) {
-      const base = PROVIDER_RETRY_DELAYS_MS[attempt - 1] ?? 1_000;
+      const base = delays[attempt - 1] ?? 1_000;
       const jitter = Math.floor(Math.random() * PROVIDER_RETRY_JITTER_MS);
       await new Promise((resolve) => setTimeout(resolve, base + jitter));
     }
@@ -371,6 +381,7 @@ async function handleLlmChat(req: Request, startedAt: number): Promise<Response>
   const completion = (await withTimeout(
     withProviderRetries(() =>
       zai.chat.completions.create({
+        model: LLM_MODEL,
         messages,
         temperature,
         ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
@@ -444,6 +455,7 @@ async function handleLlmChatStream(req: Request, startedAt: number): Promise<Res
         const res = await withTimeout(
           withProviderRetries(() =>
             zai.chat.completions.create({
+              model: LLM_MODEL,
               messages,
               temperature,
               ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
@@ -568,7 +580,10 @@ async function handleStt(req: Request, startedAt: number): Promise<Response> {
 
   const zai = await getZai();
   const response = (await withTimeout(
-    withProviderRetries(() => zai.audio.asr.create({ file_base64: decoded.toString("base64") })),
+    withProviderRetries(
+      () => zai.audio.asr.create({ file_base64: decoded.toString("base64") }),
+      STT_RETRY_DELAYS_MS, // fallback path: outlive the provider 429 window
+    ),
     PROVIDER_TIMEOUT_MS,
     "stt",
   )) as AsrResponse;
