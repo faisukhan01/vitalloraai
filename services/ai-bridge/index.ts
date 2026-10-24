@@ -396,6 +396,139 @@ async function handleLlmChat(req: Request, startedAt: number): Promise<Response>
 }
 
 // ---------------------------------------------------------------------------
+// POST /llm/chat/stream — token-streaming chat for voice first-audio latency
+// ---------------------------------------------------------------------------
+// Same request shape as /llm/chat. Response is a chunked body of newline-
+// delimited JSON events (NOT SSE — no "data:" prefixes):
+//   {"d":"<text fragment>"}   repeated as tokens arrive
+//   {"done":true,"model":"..."}
+// Downstream (FastAPI orchestrator) extracts the spoken sentence from the
+// fragments while the model is still generating, cutting ~0.5-1s off the
+// time until the receptionist starts speaking.
+
+interface StreamChunk {
+  choices?: Array<{ delta?: { content?: string | null } | null }> | null;
+  model?: string | null;
+}
+
+async function handleLlmChatStream(req: Request, startedAt: number): Promise<Response> {
+  const body = await readJsonBody(req);
+  const messages = validateMessages(body);
+  const temperature = validateNumber(body, "temperature", {
+    min: 0,
+    max: 2,
+    required: false,
+    fallback: 0.4,
+  });
+  let maxTokens: number | undefined;
+  if (body.max_tokens !== undefined && body.max_tokens !== null) {
+    const value = body.max_tokens;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+      throw new ApiError(400, "invalid_request", "`max_tokens` must be a positive integer");
+    }
+    maxTokens = value;
+  }
+
+  const promptChars = messages.reduce((sum, m) => sum + m.content.length, 0);
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let charsOut = 0;
+      let model = "unknown";
+      const send = (obj: Record<string, unknown>) => {
+        controller.enqueue(encoder.encode(`${JSON.stringify(obj)}\n`));
+      };
+      try {
+        const zai = await getZai();
+        const res = await withTimeout(
+          withProviderRetries(() =>
+            zai.chat.completions.create({
+              messages,
+              temperature,
+              ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+              thinking: { type: "disabled" },
+              stream: true,
+            }),
+          ),
+          PROVIDER_TIMEOUT_MS,
+          "llm.chat.stream",
+        );
+
+        // The SDK returns a ReadableStream of raw SSE bytes when stream:true
+        // (probed: chunks decode to `data: {"id":...,"choices":[{"delta":...}]}`).
+        // Parse the SSE protocol ourselves; also tolerate a plain completion
+        // object in case the provider ignores the stream flag.
+        const res2 = res as unknown as { getReader?: () => ReadableStreamDefaultReader<Uint8Array> } & ChatCompletionResponse;
+        if (typeof res2?.getReader === "function") {
+          const reader = res2.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          let streamDone = false;
+          while (!streamDone) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let nl: number;
+            while ((nl = buf.indexOf("\n")) >= 0) {
+              const line = buf.slice(0, nl).trim();
+              buf = buf.slice(nl + 1);
+              if (!line.startsWith("data:")) continue;
+              const payload = line.slice(5).trim();
+              if (!payload || payload === "[DONE]") continue;
+              try {
+                const obj = JSON.parse(payload) as StreamChunk & { model?: string };
+                if (typeof obj?.model === "string" && obj.model) model = obj.model;
+                const delta = obj?.choices?.[0]?.delta?.content;
+                if (typeof delta === "string" && delta.length > 0) {
+                  charsOut += delta.length;
+                  send({ d: delta });
+                }
+              } catch {
+                /* partial/garbage line — skip */
+              }
+            }
+          }
+          void streamDone;
+        } else {
+          const completion = res as unknown as ChatCompletionResponse;
+          const content = completion?.choices?.[0]?.message?.content ?? "";
+          if (typeof completion?.model === "string" && completion.model) model = completion.model;
+          if (content) {
+            charsOut = content.length;
+            send({ d: content });
+          }
+        }
+        send({ done: true, model });
+        logRequest("info", "/llm/chat/stream", startedAt, 200, {
+          chars: promptChars,
+          audio_bytes: null,
+          chars_out: charsOut,
+          model,
+        });
+      } catch (err) {
+        // Mid-stream failures cannot change the HTTP status anymore; report an
+        // error event so the consumer can fall back to the non-streaming path.
+        const message = err instanceof Error ? err.message : String(err);
+        send({ error: message });
+        logRequest("error", "/llm/chat/stream", startedAt, 502, { code: "stream_failed" });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/x-ndjson",
+      "Cache-Control": "no-store",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // POST /stt
 // ---------------------------------------------------------------------------
 
@@ -827,6 +960,13 @@ async function route(req: Request): Promise<Response> {
         return apiError(405, "method_not_allowed", "Use POST /llm/chat");
       }
       return await handleLlmChat(req, startedAt);
+    }
+
+    if (url.pathname === "/llm/chat/stream") {
+      if (req.method !== "POST") {
+        return apiError(405, "method_not_allowed", "Use POST /llm/chat/stream");
+      }
+      return await handleLlmChatStream(req, startedAt);
     }
 
     if (url.pathname === "/stt") {

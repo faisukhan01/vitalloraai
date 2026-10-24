@@ -27,7 +27,7 @@ from app.core.errors import AuthError, ConflictError, NotFound, ProviderError, V
 from app.core.logging import log_extra, session_id_ctx
 from app.core.security import new_caller_ref, new_id, utc_now_iso
 from app.db.client import db
-from app.domain.orchestrator import run_turn
+from app.domain.orchestrator import run_turn, stream_turn
 from app.domain.tools import ToolContext
 from app.providers.base import get_llm, get_stt, get_tts
 from app.schemas.voice import (
@@ -352,6 +352,10 @@ async def _speak_instant_ack(ws: WebSocket, voice: str, speed: float) -> None:
 
 _SENTENCE_END_RE = re.compile(r"[.!?。！？](?=\s|$)")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:，；：])\s+")
+# Streaming: dispatch a sentence for synthesis as soon as it completes in the
+# LLM stream. Very short leads ("Yes.") wait for the next sentence to keep
+# every synthesis request speakable.
+_FIRST_SENTENCE_MIN = 12
 # Measured provider synthesis cost (2026-10 probe): a 32-char request takes
 # ~1.4 s while a 68-char request jumps to ~3.8 s — cost explodes with length,
 # so the FIRST spoken group must stay tiny (~25-45 chars) for fast first
@@ -487,6 +491,112 @@ def _split_speech_groups(text: str) -> list[str]:
         if cur:
             final.append(" ".join(cur))
     return final
+
+
+class _Speaker:
+    """Sequential per-connection reply speaker fed by streaming say-deltas.
+
+    Sentences are dispatched for synthesis the moment they complete in the
+    LLM stream; if the first sentence runs long with no period in sight, its
+    opening CLAUSE is dispatched instead (measured: a 24-char synthesis is
+    ~1.3 s vs ~2.2 s for 32+, and 3.8 s for 68+). A FIFO task list plus a
+    semaphore keeps provider calls strictly sequential (concurrency trips 429
+    throttling) while each synthesis overlaps playback of the previous chunk.
+    """
+
+    def __init__(self, ws: WebSocket, voice: str, speed: float) -> None:
+        self._ws = ws
+        self._voice = voice
+        self._speed = speed
+        self._sem = asyncio.Semaphore(1)
+        self._tasks: list[asyncio.Task] = []
+        self._buffer = ""
+        self._sent_any = False
+        self._first_error: ProviderError | None = None
+
+    # ── group extraction ──────────────────────────────────────────────────
+    def _start(self, text: str) -> None:
+        """Schedule a group; lead-split long first groups for fast first audio."""
+        text = text.strip()
+        if not text:
+            return
+        if not self._tasks and len(text) > _FIRST_GROUP_MAX:
+            split = _lead_clause(text, _FIRST_GROUP_MAX + 40)
+            if split:
+                log_extra(ws_logger, logging.INFO, "lead clause split", lead=len(split[0]), rest=len(split[1]))
+                self._tasks.append(asyncio.ensure_future(self._speak_one(split[0])))
+                rest = split[1].strip()
+                if rest:
+                    self._tasks.append(asyncio.ensure_future(self._speak_one(rest)))
+                return
+        self._tasks.append(asyncio.ensure_future(self._speak_one(text)))
+
+    def _last_sentence_boundary(self) -> re.Match | None:
+        boundary = None
+        for m in _SENTENCE_END_RE.finditer(self._buffer):
+            boundary = m
+        return boundary
+
+    def feed_delta(self, delta: str) -> None:
+        """Accumulate streamed text; dispatch every speakable group."""
+        self._buffer += delta
+        while True:
+            if not self._tasks and len(self._buffer) > _FIRST_GROUP_MAX:
+                boundary = self._last_sentence_boundary()
+                if boundary is None or boundary.end() < _FIRST_SENTENCE_MIN:
+                    # No sentence end in sight: dispatch the opening clause now.
+                    clause = None
+                    for m in _CLAUSE_SPLIT_RE.finditer(self._buffer):
+                        if m.start() >= _FIRST_SENTENCE_MIN:
+                            clause = m
+                            break
+                    if clause is not None:
+                        lead, self._buffer = self._buffer[: clause.start()], self._buffer[clause.start():]
+                        self._start(lead)
+                        continue
+            boundary = self._last_sentence_boundary()
+            if boundary is None or boundary.end() < _FIRST_SENTENCE_MIN:
+                return
+            sentence, self._buffer = self._buffer[: boundary.end()].strip(), self._buffer[boundary.end():]
+            if sentence:
+                self._start(sentence)
+
+    def flush(self) -> None:
+        """Dispatch whatever remains after the stream ends."""
+        tail = self._buffer.strip()
+        self._buffer = ""
+        if tail:
+            self._start(tail)
+
+    # Public alias for the non-streaming fallback path (final result).
+    def dispatch(self, text: str) -> None:
+        self._start(text)
+
+    async def _speak_one(self, text: str) -> None:
+        async with self._sem:
+            if self._first_error is not None:
+                return
+            try:
+                audio_b64, fmt = await get_tts().synthesize(text, voice=self._voice, speed=self._speed)
+            except ProviderError as exc:
+                if not self._sent_any:
+                    self._first_error = exc
+                log_extra(ws_logger, logging.WARNING, "tts group failed", chars=len(text), sent_any=self._sent_any)
+                return
+            if not self._sent_any:
+                self._sent_any = True
+                with suppress(Exception):
+                    await self._ws.send_json({"type": "status", "stage": "speaking"})
+            with suppress(Exception):
+                await self._ws.send_json({"type": "audio", "format": fmt, "data": audio_b64})
+
+    async def wait_done(self) -> None:
+        """Await all synthesis/sends; surface the failure if NOTHING was sent."""
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+        if self._first_error is not None and not self._sent_any:
+            raise self._first_error
 
 
 async def _speak_stream_and_send(ws: WebSocket, text: str, voice: str, speed: float) -> None:
@@ -678,7 +788,10 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
             # the current utterance is appended to the prompt explicitly).
             _bg(_persist_message(session_id, principal.organization_id, "user", user_text))
 
-            # ── 2) Orchestration (safety + RAG + tools) ──────────────────
+            # ── 2) Orchestration (safety + RAG + tools), STREAMING ────────
+            # The reply streams sentence-by-sentence: each completed sentence
+            # is dispatched for TTS while the LLM is still generating the rest,
+            # cutting first-audio latency by ~0.5-1s versus wait-for-everything.
             await websocket.send_json({"type": "status", "stage": "thinking"})
             import time as _time
 
@@ -686,19 +799,61 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
             t_stt_done = getattr(websocket.state, "_t_stt_done", None)
             if t_stt_done is not None:
                 log_extra(ws_logger, logging.INFO, "pre-llm overhead", ms=int((t0 - t_stt_done) * 1000))
+
+            speaker = _Speaker(websocket, voice_id, speed)
+            say_parts: list[str] = []
+            stream_error: Exception | None = None
             try:
-                result = await run_turn(
+                async for ev_kind, ev_payload in stream_turn(
                     ctx=ctx,
                     receptionist=receptionist,
                     clinic=clinic,
                     org_name=org_name,
                     language=language,
                     user_text=user_text,
-                )
-            except ProviderError:
-                # Never leave the caller in dead silence: apologize in voice,
-                # keep the session alive and return to listening so a simple
-                # retry just works once the provider throttle window passes.
+                ):
+                    if ev_kind == "say_delta":
+                        say_parts.append(ev_payload)
+                        speaker.feed_delta(ev_payload)
+                    elif ev_kind == "tool":
+                        await websocket.send_json({"type": "tool", "tool": ev_payload.get("tool"), "arguments": ev_payload.get("arguments")})
+                        _bg(_persist_message(
+                            session_id, principal.organization_id, "tool", None,
+                            tool_name=ev_payload.get("tool"), tool_payload=ev_payload.get("arguments"),
+                        ))
+                    elif ev_kind == "final":
+                        if not getattr(ev_payload, "streamed", False) and ev_payload.say:
+                            # Non-streaming fallback result — speak it the same way.
+                            say_parts.append(ev_payload.say)
+                            speaker.dispatch(ev_payload.say)
+                        if ev_payload.outcome_hint:
+                            hint = ev_payload.outcome_hint
+                            _bg(db.write(
+                                "UPDATE conversation_sessions SET outcome = ? WHERE id = ? AND outcome IS NULL",
+                                (hint, session_id),
+                            ))
+                        if not getattr(ev_payload, "streamed", False):
+                            # Fallback path: tool calls were NOT yielded as
+                            # events — emit them here. (Streamed results already
+                            # emitted each tool as it happened.)
+                            for tc in ev_payload.tool_calls:
+                                await websocket.send_json({"type": "tool", "tool": tc.get("tool"), "arguments": tc.get("arguments")})
+                                _bg(_persist_message(
+                                    session_id, principal.organization_id, "tool", None,
+                                    tool_name=tc.get("tool"), tool_payload=tc.get("arguments"),
+                                ))
+            except ProviderError as exc:
+                stream_error = exc
+            except Exception:  # noqa: BLE001
+                ws_logger.exception("orchestrator failure")
+                stream_error = Exception("unexpected")
+
+            turn_ms = int((_time.perf_counter() - t0) * 1000)
+            say_text = "".join(say_parts).strip()
+
+            if stream_error is not None and not say_text:
+                # Nothing could be produced (LLM/provider failure): apologize in
+                # voice, keep the session alive so a retry just works.
                 await _persist_message(session_id, principal.organization_id, "system", "llm_error")
                 await websocket.send_json({"type": "transcript", "role": "assistant", "text": _BUSY_SAY})
                 _bg(_persist_message(session_id, principal.organization_id, "assistant", _BUSY_SAY))
@@ -706,35 +861,19 @@ async def voice_ws(websocket: WebSocket, session_id: str, token: str = "") -> No
                     await _speak_stream_and_send(websocket, _BUSY_SAY, voice_id, speed)
                 await websocket.send_json({"type": "status", "stage": "listening"})
                 continue
-            except Exception:  # noqa: BLE001
-                ws_logger.exception("orchestrator failure")
-                await websocket.send_json({"type": "error", "message": "An unexpected error occurred."})
-                continue
-            turn_ms = int((_time.perf_counter() - t0) * 1000)
-            log_extra(ws_logger, logging.INFO, "orchestrated", turn_ms=turn_ms, say_chars=len(result.say), tools=len(result.tool_calls))
 
-            for tc in result.tool_calls:
-                await websocket.send_json({"type": "tool", "tool": tc.get("tool"), "arguments": tc.get("arguments")})
-                _bg(_persist_message(
-                    session_id, principal.organization_id, "tool", None,
-                    tool_name=tc.get("tool"), tool_payload=tc.get("arguments"),
-                ))
-            if result.outcome_hint:
-                _bg(db.write(
-                    "UPDATE conversation_sessions SET outcome = ? WHERE id = ? AND outcome IS NULL",
-                    (result.outcome_hint, session_id),
-                ))
+            log_extra(ws_logger, logging.INFO, "orchestrated", turn_ms=turn_ms, say_chars=len(say_text), streamed=not stream_error)
 
-            await websocket.send_json({"type": "transcript", "role": "assistant", "text": result.say})
+            await websocket.send_json({"type": "transcript", "role": "assistant", "text": say_text or _BUSY_SAY})
             _bg(_persist_message(
-                session_id, principal.organization_id, "assistant", result.say, latency_ms=turn_ms
+                session_id, principal.organization_id, "assistant", say_text or _BUSY_SAY, latency_ms=turn_ms
             ))
             _bg(_record_usage(principal.organization_id, session_id, "llm_requests", get_llm().name, 1))
 
-            # ── 3) Speech synthesis (sentence-streamed for fast first audio)
-            log_extra(ws_logger, logging.INFO, "speak start", post_orchestration_ms=int((_time.perf_counter() - t0) * 1000 - turn_ms))
+            # ── 3) Finish synthesis of any tail and wait for all audio ────
+            speaker.flush()
             try:
-                await _speak_stream_and_send(websocket, result.say, voice_id, speed)
+                await speaker.wait_done()
             except ProviderError:
                 await websocket.send_json({"type": "error", "message": "Voice synthesis failed; showing text only."})
             await websocket.send_json({"type": "status", "stage": "listening"})

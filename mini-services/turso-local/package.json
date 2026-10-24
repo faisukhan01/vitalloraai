@@ -1,0 +1,10 @@
+{
+  "name": "@vitalora/turso-local",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Turso HTTP API (v2/pipeline) emulator backed by bun:sqlite — offline development without cloud credentials",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  }
+}

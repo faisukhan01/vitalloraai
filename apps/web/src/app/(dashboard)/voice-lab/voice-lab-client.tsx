@@ -41,11 +41,11 @@ interface Turn extends Pick<ConversationMessage, "role" | "content" | "tool_name
   id: string;
 }
 
-const SILENCE_MS = 420; // snappy phone-like turn taking: send ~0.4s after the caller stops
+const SILENCE_MS = 330; // snappy phone-like turn taking: send ~1/3s after the caller stops
 const MAX_UTTERANCE_MS = 15000;
 const MIN_UTTERANCE_MS = 250; // accept short utterances ("yes") quickly, still discard blips
 const CALIBRATION_FRAMES = 12; // ~0.2 s ambient-noise sampling — barely delays first capture
-const LOW_MIC_HINT_MS = 6000;
+const LOW_MIC_HINT_MS = 4500;
 
 interface WavPacket {
   b64: string;
@@ -501,7 +501,9 @@ export function VoiceLabClient() {
         calibSamplesRef.current.push(rms);
         if (calibSamplesRef.current.length >= CALIBRATION_FRAMES) {
           const floor = Math.min(...calibSamplesRef.current);
-          thresholdRef.current = Math.max(0.016, Math.min(0.06, floor * 3 + 0.008));
+          // More sensitive than the old cap (0.06): a noisy room must never
+          // make the mic deaf — the user's #1 complaint was "not listening".
+          thresholdRef.current = Math.max(0.014, Math.min(0.048, floor * 2.6 + 0.006));
           calibDoneRef.current = true;
         }
       }
@@ -537,7 +539,7 @@ export function VoiceLabClient() {
           quietMsRef.current += dt;
           if (quietMsRef.current > LOW_MIC_HINT_MS && !recordingRef.current) {
             setMicHint(
-              "Speak a little closer to the microphone — or use the text input below if your mic is unavailable.",
+              "We can barely hear you — speak a little louder and closer to the mic, or type your question in the box below.",
             );
             quietMsRef.current = 0;
           }

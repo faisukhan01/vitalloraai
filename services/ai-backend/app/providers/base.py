@@ -12,7 +12,9 @@ Contract (shared by all providers):
 
 from __future__ import annotations
 
+import json as _json
 import logging
+from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 import httpx
@@ -32,6 +34,14 @@ class LLMProvider(Protocol):
     name: str
 
     async def chat(self, messages: list[dict[str, str]], temperature: float = 0.4, max_tokens: int | None = None) -> str: ...
+
+
+class StreamingLLMProvider(LLMProvider, Protocol):
+    """LLM that can stream tokens (voice first-audio latency optimization)."""
+
+    def chat_stream(
+        self, messages: list[dict[str, str]], temperature: float = 0.4, max_tokens: int | None = None
+    ) -> AsyncIterator[str]: ...
 
 
 class STTProvider(Protocol):
@@ -99,6 +109,47 @@ class ZAIBridgeProvider:
             raise ProviderError("The AI model returned an empty response.")
         log_extra(logger, logging.DEBUG, "llm call", chars=len(content))
         return content
+
+    async def chat_stream(
+        self, messages: list[dict[str, str]], temperature: float = 0.4, max_tokens: int | None = None
+    ) -> AsyncIterator[str]:
+        """Yield reply text fragments as the model generates them.
+
+        Speaks to the bridge's /llm/chat/stream (newline-delimited JSON events).
+        Raises ProviderError on connection failure or an explicit error event —
+        callers fall back to the non-streaming chat() in that case.
+        """
+        payload: dict[str, Any] = {"messages": messages, "temperature": temperature}
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        timed = httpx.Timeout(LLM_TIMEOUT, connect=5.0, pool=5.0)
+        try:
+            async with self._client.stream("POST", "/llm/chat/stream", json=payload, timeout=timed) as resp:
+                if resp.status_code != 200:
+                    raise ProviderError(f"AI provider error ({resp.status_code}) on stream.")
+                buffer = ""
+                async for chunk in resp.aiter_text():
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = _json.loads(line)
+                        except _json.JSONDecodeError:
+                            continue
+                        if event.get("error"):
+                            raise ProviderError(f"AI stream failed: {event['error']}")
+                        delta = event.get("d")
+                        if isinstance(delta, str) and delta:
+                            yield delta
+                        if event.get("done"):
+                            return
+        except httpx.TimeoutException as exc:
+            raise ProviderError("The AI service took too long to respond.") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError("The AI service is unreachable. Is the ai-bridge sidecar running?") from exc
 
     async def transcribe(self, audio_base64: str, language: str | None = None) -> str:
         data = await self._post("/stt", {"file_base64": audio_base64, "language": language}, timeout=STT_TIMEOUT)
